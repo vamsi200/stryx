@@ -5,6 +5,8 @@ use std::{
 };
 
 use anyhow::Context;
+use rand::{RngExt, rng};
+use stryx::error::DecodeError;
 
 #[derive(Debug)]
 struct Block {
@@ -24,9 +26,54 @@ struct Record<'a> {
     value: &'a [u8],
 }
 
-trait Encode {
-    fn encode_len(&self) -> usize;
-    fn encode_record(&self, value: &mut Vec<u8>) -> anyhow::Result<()>;
+struct RecordReader<'a> {
+    value: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RecordReader<'a> {
+    pub fn new(value: &'a [u8]) -> Self {
+        Self { value, pos: 0 }
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<Record<'a>>, DecodeError> {
+        if self.pos == self.value.len() {
+            return Ok(None);
+        }
+
+        let remaining = &self.value[self.pos..];
+
+        if remaining.len() < 6 {
+            return Err(DecodeError::Truncated);
+        }
+
+        let key_len = u16::from_le_bytes([remaining[0], self.value[1]]) as usize;
+        let value_len = u32::from_le_bytes(
+            remaining[2..6]
+                .try_into()
+                .map_err(|_| DecodeError::InvalidLength)?,
+        ) as usize;
+
+        let record_len = 6usize
+            .checked_add(key_len)
+            .and_then(|v| v.checked_add(value_len))
+            .ok_or(DecodeError::InvalidLength)?;
+
+        if remaining.len() < record_len {
+            return Err(DecodeError::Truncated);
+        }
+
+        let key = &remaining[6..6 + key_len];
+        let value = &remaining[6 + key_len..record_len];
+
+        self.pos += record_len;
+
+        Ok(Some(Record { key, value }))
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
 }
 
 impl Encode for Record<'_> {
@@ -35,8 +82,12 @@ impl Encode for Record<'_> {
     }
 
     fn encode_record(&self, value: &mut Vec<u8>) -> anyhow::Result<()> {
-        let key_len = u16::try_from(self.key.len()).context("Key Too Large")?;
-        let value_len = u32::try_from(self.value.len()).context("Value Too Large")?;
+        let key_len = u16::try_from(self.key.len())
+            .context("Key Too Large")
+            .unwrap();
+        let value_len = u32::try_from(self.value.len())
+            .context("Value Too Large")
+            .unwrap();
 
         value.reserve(self.encode_len());
 
@@ -45,44 +96,51 @@ impl Encode for Record<'_> {
 
         value.extend_from_slice(&self.key);
         value.extend_from_slice(&self.value);
-
         Ok(())
     }
 }
 
-trait Decode<'a>: Sized {
-    fn decode(value: &'a [u8]) -> anyhow::Result<(Self, usize)>;
-}
-
-impl<'a> Decode<'a> for Record<'a> {
-    fn decode(value: &'a [u8]) -> anyhow::Result<(Self, usize)> {
-        let key_len = u16::from_le_bytes([value[0], value[1]]) as usize;
-        let value_len = u32::from_le_bytes(value[2..6].try_into()?) as usize;
-
-        Ok((
-            Self {
-                key: &value[6..6 + key_len],
-                value: &value[6 + key_len..6 + key_len + value_len],
-            },
-            0,
-        ))
-    }
+trait Encode {
+    fn encode_len(&self) -> usize;
+    fn encode_record(&self, value: &mut Vec<u8>) -> anyhow::Result<()>;
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut file = OpenOptions::new().create(true).write(true).open("test")?;
-    let (key, value) = ("key", "value");
-    let record = Record {
-        key: key.as_bytes(),
-        value: value.as_bytes(),
-    };
-
-    let mut output = Vec::new();
-    record.encode_record(&mut output)?;
-    println!("{}", output.len());
-
-    let record = Record::decode(&output)?.0;
-    println!("{}", str::from_utf8(record.key)?);
-    println!("{}", str::from_utf8(record.value)?);
     Ok(())
+}
+
+fn random_records(n: usize) -> Vec<Record<'static>> {
+    let mut rng = rand::rng();
+    (0..n)
+        .map(|_| {
+            let key_len = rng.random_range(4..16);
+            let val_len = rng.random_range(8..64);
+            let key: Vec<u8> = (0..key_len).map(|_| rng.random()).collect();
+            let value: Vec<u8> = (0..val_len).map(|_| rng.random()).collect();
+            let key: &'static [u8] = Box::leak(key.into_boxed_slice());
+            let value: &'static [u8] = Box::leak(value.into_boxed_slice());
+
+            Record { key, value }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode() {
+        let mut output = Vec::new();
+        for record in random_records(10) {
+            record.encode_record(&mut output);
+        }
+
+        let mut record_reader = RecordReader::new(&output);
+
+        while let Some(record) = record_reader.next_record().unwrap() {
+            assert!(record.key.len() > 0);
+            assert!(record.value.len() > 0);
+        }
+    }
 }
