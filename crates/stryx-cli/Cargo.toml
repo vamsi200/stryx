@@ -1,0 +1,13 @@
+[package]
+name = "stryx-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "stryx"
+path = "src/main.rs"
+
+[dependencies]
+stryx = { path = "../stryx" }
+anyhow.workspace = true
+clap.workspace = true

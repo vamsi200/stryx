@@ -9,3 +9,9 @@ pub enum DecodeError {
     #[error("Failed to convert slice: {0}")]
     SliceConversion(#[from] TryFromSliceError),
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum StryxError {
+    #[error("Not implemented")]
+    NotImplemented,
+}

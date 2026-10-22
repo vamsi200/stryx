@@ -2,28 +2,45 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use rand::{RngExt, rng};
-use stryx::error::DecodeError;
+use stryx::{
+    builder::{Record, TableBuilder},
+    error::DecodeError,
+};
+
+const BLOCK_SIZE_IN_KB: u8 = 16;
 
 #[derive(Debug)]
-struct Block {
+struct DataBlock<'a> {
+    records: &'a [Record<'a>],
+    offsets: &'a [u32],
     records_count: u32,
+}
+
+#[derive(Debug)]
+struct IndexBlock {
+    first_key: u32,
+    block_offset: u32,
+    block_size: u32,
     checksum: u32,
+}
+
+#[derive(Debug)]
+struct Footer {
+    pub index_offset: u64,
+    pub index_size: u64,
+    pub version: u16,
+    pub magic_bytes: [u8; 8],
 }
 
 #[derive(Debug)]
 struct RecordInfo {
     key_len: u16,
     value_len: u32,
-}
-
-#[derive(Debug)]
-struct Record<'a> {
-    key: &'a [u8],
-    value: &'a [u8],
 }
 
 struct RecordReader<'a> {
@@ -105,7 +122,46 @@ trait Encode {
     fn encode_record(&self, value: &mut Vec<u8>) -> anyhow::Result<()>;
 }
 
+fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
+    file.write_all(&value)?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    let mut table = TableBuilder::create("test");
+    let record = Record {
+        key: &[0u8],
+        value: &[0u8],
+    };
+
+    table.add(&[0u8], &[0u8]);
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .append(true)
+        .open("test")?;
+
+    // let mut output = Vec::new();
+    // for record in random_records(100_000) {
+    //     record.encode_record(&mut output);
+    // }
+    //
+    // write_to_file(&mut file, &output)?;
+
+    let mut start = Instant::now();
+    let mut buf = Vec::new();
+
+    file.read_to_end(&mut buf)?;
+
+    let mut record_reader = RecordReader::new(&buf);
+
+    let mut record_count = 0;
+    while let Some(record) = record_reader.next_record()? {
+        std::hint::black_box(record);
+    }
+
+    println!("elapsed: {:?}", start.elapsed());
     Ok(())
 }
 

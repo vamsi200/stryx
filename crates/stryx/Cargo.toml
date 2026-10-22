@@ -1,0 +1,10 @@
+[package]
+name = "stryx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32c.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
