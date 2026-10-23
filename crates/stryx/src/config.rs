@@ -2,6 +2,9 @@
 
 use crate::error::StryxError;
 
+pub const BLOCK_SIZE: usize = 16 * 1024;
+
+#[derive(Debug)]
 pub struct TableOptions {
     /// Target encoded data block size in bytes
     pub block_size: usize,
@@ -28,32 +31,52 @@ pub struct TableOptions {
     pub restart_interval: usize,
 }
 
+#[derive(Default, Debug)]
 pub enum Compression {
     None,
     Lz4,
+    #[default]
     Zstd,
 }
 
+#[derive(Default, Debug)]
 pub enum Checksum {
     None,
+    #[default]
     Crc32c,
 }
 
+#[derive(Default, Debug)]
 pub enum IndexType {
+    #[default]
     Sparse,
 }
 
+#[derive(Default, Debug, PartialEq)]
 pub enum KeyOrder {
+    #[default]
     Lexicographic,
 }
 
+#[derive(Default, Debug, PartialEq)]
 pub enum DuplicatePolicy {
+    #[default]
     Reject,
+    Allow,
 }
 
 impl Default for TableOptions {
     fn default() -> Self {
-        todo!()
+        Self {
+            block_size: BLOCK_SIZE,
+            bloom_filter_bits_per_key: None,
+            compression: Compression::default(),
+            checksum: Checksum::default(),
+            index_type: IndexType::default(),
+            key_order: KeyOrder::default(),
+            duplicate_policy: DuplicatePolicy::default(),
+            restart_interval: 0,
+        }
     }
 }
 
