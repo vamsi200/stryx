@@ -1,6 +1,7 @@
 #![allow(unused)]
 use std::{
     fs::{File, OpenOptions},
+    hint::black_box,
     io::{BufWriter, Read, Write},
     time::{Duration, Instant},
 };
@@ -11,6 +12,7 @@ use stryx::{
     builder::{Record, RecordReader, TableBuilder},
     config::TableOptions,
     error::DecodeError,
+    reader::TableReader,
 };
 
 fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
@@ -20,9 +22,29 @@ fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let mut table = TableBuilder::create("test.stryx", TableOptions::default())?;
-    table.add_batch(random_records(10_000))?;
+    let records = random_records(100_000);
+    let keys: Vec<_> = records.iter().step_by(10).map(|r| r.key.to_vec()).collect();
 
+    table.add_batch(records);
     table.finalize()?;
+
+    let mut reader = TableReader::open("test.stryx")?;
+
+    for key in &keys {
+        black_box(reader.get(black_box(key))?);
+    }
+
+    let start = Instant::now();
+
+    for key in &keys {
+        black_box(reader.get(black_box(key))?);
+    }
+
+    let elapsed = start.elapsed();
+
+    println!("Lookups: {}", keys.len());
+    println!("Total: {:?}", elapsed);
+    println!("Average: {:?}", elapsed / keys.len() as u32);
 
     //
     // write_to_file(&mut file, &output)?;

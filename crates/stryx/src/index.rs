@@ -1,6 +1,9 @@
 #![allow(unused)]
 
-use crate::error::StryxError;
+use crate::{
+    decoder::Decoder,
+    error::{DecodeError, StryxError},
+};
 
 #[derive(Debug)]
 pub(crate) struct IndexBuilder {
@@ -69,5 +72,29 @@ impl IndexEntry {
         dst.extend_from_slice(&self.size.to_le_bytes());
 
         Ok(())
+    }
+
+    pub fn decode<'a>(decoder: &mut Decoder<'a>) -> Result<Self, StryxError> {
+        let key_len = decoder.read_u16()?;
+        let first_key = decoder.read_bytes(key_len as usize)?;
+        let block_offset = u64::from_le_bytes(
+            decoder
+                .read_bytes(8)?
+                .try_into()
+                .map_err(DecodeError::from)?,
+        );
+
+        let block_size = u32::from_le_bytes(
+            decoder
+                .read_bytes(4)?
+                .try_into()
+                .map_err(DecodeError::from)?,
+        );
+
+        Ok(Self {
+            first_key: first_key.to_vec(),
+            offset: block_offset,
+            size: block_size,
+        })
     }
 }

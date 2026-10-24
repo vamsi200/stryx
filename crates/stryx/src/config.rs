@@ -1,8 +1,6 @@
 //TableConfig or Options whichever
 
-use crate::error::StryxError;
-
-pub const BLOCK_SIZE: usize = 16 * 1024;
+use crate::{BLOCK_SIZE, error::StryxError};
 
 #[derive(Debug)]
 pub struct TableOptions {

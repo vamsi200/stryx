@@ -6,7 +6,7 @@ pub enum DecodeError {
     Truncated,
     #[error("Invalid record len")]
     InvalidLength,
-    #[error("Failed to convert slice: {0}")]
+    #[error("{0}")]
     SliceConversion(#[from] TryFromSliceError),
 }
 
@@ -34,4 +34,13 @@ pub enum StryxError {
 
     #[error("Key violates the configured ordering; configure TableOptions::KeyOrder")]
     InvalidKeyOrder,
+
+    #[error("Invalid Magic bytes, invalid file or corrupted")]
+    InvalidMagic,
+
+    #[error("Invalid stryx version")]
+    InvalidVersion,
+
+    #[error("Invalid checksum")]
+    InvalidChecksum,
 }

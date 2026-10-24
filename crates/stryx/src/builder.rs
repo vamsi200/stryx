@@ -9,7 +9,8 @@ use std::{
 use anyhow::Context;
 
 use crate::{
-    config::{BLOCK_SIZE, DuplicatePolicy, KeyOrder, TableOptions},
+    BLOCK_SIZE, MAGIC, VERSION,
+    config::{DuplicatePolicy, KeyOrder, TableOptions},
     error::{DecodeError, StryxError},
     index::{IndexBuilder, IndexEntry},
 };
@@ -27,7 +28,7 @@ impl<'a> Record<'a> {
 }
 
 #[derive(Debug)]
-struct DataBlock<'a> {
+pub struct DataBlock<'a> {
     records: &'a [Record<'a>],
     offsets: &'a [u32],
     records_count: u32,
@@ -157,6 +158,7 @@ impl TableBuilder<BufWriter<File>> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(true)
             .read(true)
             .open(path)?;
 
@@ -175,7 +177,15 @@ impl TableBuilder<BufWriter<File>> {
 impl<'a, W: std::io::Write> TableBuilder<W> {
     /// Create an SSTable using a custom writer
     pub fn new(writer: W, options: TableOptions) -> Result<Self, StryxError> {
-        todo!()
+        Ok(Self {
+            writer,
+            block: BlockBuilder::new(),
+            index: IndexBuilder::new(),
+            options,
+            last_key: None,
+            block_first_key: None,
+            offset: 0,
+        })
     }
 
     /// Append a record
@@ -198,7 +208,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         if !self.block.is_empty()
             && self.block.size() + encoded_record.len() + size_of::<u32>() > BLOCK_SIZE
         {
-            println!("Exceeds Block Size, inserting into new one..");
+            // println!("Exceeds Block Size, inserting into new one..");
             self.flush_block()?;
         }
 
@@ -214,6 +224,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         Ok(())
     }
 
+    // Construct the block and flush it
     fn flush_block(&mut self) -> Result<(), StryxError> {
         if self.block.is_empty() {
             return Ok(());
@@ -267,8 +278,8 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         // footer
         self.writer.write_all(&index_offset.to_le_bytes())?;
         self.writer.write_all(&index_size.to_le_bytes())?;
-        self.writer.write_all(&1u32.to_le_bytes())?; // version btw
-        self.writer.write_all(b"STRYX001")?; // magic bytes
+        self.writer.write_all(&VERSION.to_le_bytes())?; // version btw
+        self.writer.write_all(MAGIC)?; // magic bytes
 
         self.writer.flush()?;
 
