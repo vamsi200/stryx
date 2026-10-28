@@ -43,4 +43,10 @@ pub enum StryxError {
 
     #[error("Invalid checksum")]
     InvalidChecksum,
+
+    #[error("Key Not Found")]
+    KeyNotFound,
+
+    #[error("Invalid Range")]
+    InvalidRange,
 }

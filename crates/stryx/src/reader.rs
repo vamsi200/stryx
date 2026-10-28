@@ -1,9 +1,10 @@
 #![allow(unused)]
 use std::{
+    collections::btree_map::Values,
     fs::File,
     io::{Read, Seek},
     path::Path,
-    u8,
+    u8, vec,
 };
 
 use crate::{
@@ -71,11 +72,12 @@ impl<'a> BlockReader<'a> {
         })
     }
 
-    fn get(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+    fn get(&self, key: &[u8]) -> Option<(&[u8], u32)> {
         self.records
             .iter()
-            .find(|x| x.key == key)
-            .and_then(|r| Some(r.value))
+            .enumerate()
+            .find(|(_, record)| record.key == key)
+            .map(|(idx, record)| (record.value, self.offsets[idx]))
     }
 }
 
@@ -175,32 +177,69 @@ impl TableReader {
         self.file.read_exact(&mut block_buf)?;
 
         let reader = BlockReader::new(&block_buf)?;
-        Ok(reader.get(key).and_then(|x| Some(x.to_vec())))
+        Ok(reader.get(key).and_then(|x| Some(x.0.to_vec())))
     }
 
     /// Check whether a key exists
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool, StryxError> {
-        todo!()
+    pub fn contains_key(&mut self, key: &[u8]) -> Result<bool, StryxError> {
+        if self.get(key)?.is_some() {
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     /// Batch point lookups
-    pub fn get_many(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StryxError> {
-        todo!()
+    pub fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StryxError> {
+        let mut out = vec![];
+        for key in keys {
+            out.push(self.get(*key)?);
+        }
+
+        Ok(out)
     }
 
     /// Iterate over all records in sorted order
-    pub fn iter(&self) -> Result<TableIterator<'_>, StryxError> {
-        todo!()
+    pub fn iter(&mut self) -> impl Iterator<Item = Result<OwnedRecord, StryxError>> + '_ {
+        TableIterator::new(self)
     }
 
     /// Iterate over a bounded key range
-    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<TableIterator<'_>, StryxError> {
-        todo!()
+    pub fn range(&mut self, start: &[u8], end: &[u8]) -> Result<TableIterator<'_>, StryxError> {
+        if start >= end {
+            return Err(StryxError::InvalidRange);
+        }
+
+        let block = self
+            .index
+            .partition_point(|entry| entry.first_key.as_slice() <= start);
+
+        let block_idx = block.saturating_sub(1);
+
+        Ok(TableIterator {
+            reader: self,
+            block_idx,
+            record_idx: 0,
+            records: Vec::new(),
+            start_key: Some(start.to_vec()),
+            end_key: Some(end.to_vec()),
+            prefix: None,
+            finished: false,
+        })
     }
 
     /// Iterate over keys sharing a prefix
-    pub fn prefix(&self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
-        todo!()
+    pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
+        Ok(TableIterator {
+            reader: self,
+            block_idx: 0,
+            record_idx: 0,
+            records: Vec::new(),
+            start_key: None,
+            end_key: None,
+            prefix: Some(prefix.to_vec()),
+            finished: false,
+        })
     }
 
     /// Return table metadata
@@ -226,7 +265,132 @@ pub struct ReadStats {
     // TODO
 }
 
+#[derive(Debug)]
+pub struct OwnedRecord {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 pub struct TableIterator<'a> {
-    _marker: std::marker::PhantomData<&'a TableReader>,
-    // TODO
+    reader: &'a mut TableReader,
+    block_idx: usize,
+    record_idx: usize,
+    records: Vec<OwnedRecord>,
+    start_key: Option<Vec<u8>>,
+    end_key: Option<Vec<u8>>,
+    prefix: Option<Vec<u8>>,
+    finished: bool,
+}
+
+impl<'a> TableIterator<'a> {
+    fn new(reader: &'a mut TableReader) -> Self {
+        Self {
+            reader,
+            block_idx: 0,
+            record_idx: 0,
+            records: vec![],
+            start_key: None,
+            end_key: None,
+            prefix: None,
+            finished: false,
+        }
+    }
+}
+
+impl Iterator for TableIterator<'_> {
+    type Item = Result<OwnedRecord, StryxError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            if self.record_idx < self.records.len() {
+                let record = &self.records[self.record_idx];
+
+                // return if end_key is some and is found or return early if key doesn't start with
+                // prefix..
+                if self
+                    .end_key
+                    .as_ref()
+                    .is_some_and(|end| record.key.as_slice() >= end.as_slice())
+                    || self
+                        .prefix
+                        .as_ref()
+                        .is_some_and(|prefix| !record.key.starts_with(prefix))
+                {
+                    self.finished = true;
+                    return None;
+                }
+
+                let record = std::mem::replace(
+                    &mut self.records[self.record_idx],
+                    OwnedRecord {
+                        key: Vec::new(),
+                        value: Vec::new(),
+                    },
+                );
+
+                self.record_idx += 1;
+                return Some(Ok(record));
+            }
+
+            if self.block_idx >= self.reader.index.len() {
+                self.finished = true;
+                return None;
+            }
+
+            let entry = &self.reader.index[self.block_idx];
+            self.block_idx += 1;
+
+            let mut block_buf = vec![0u8; entry.size as usize];
+
+            let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
+                self.reader
+                    .file
+                    .seek(std::io::SeekFrom::Start(entry.offset))?;
+                self.reader.file.read_exact(&mut block_buf)?;
+
+                let block_reader = BlockReader::new(&block_buf)?;
+
+                let start_pos = self
+                    .start_key
+                    .as_deref()
+                    .or(self.prefix.as_deref())
+                    .map(|key| {
+                        block_reader
+                            .records
+                            .partition_point(|record| record.key < key)
+                    })
+                    .unwrap_or(0);
+
+                let records: Vec<OwnedRecord> = block_reader.records[start_pos..]
+                    .iter()
+                    .take_while(|record| {
+                        self.prefix
+                            .as_ref()
+                            .is_none_or(|prefix| record.key.starts_with(prefix))
+                    })
+                    .map(|record| OwnedRecord {
+                        key: record.key.to_vec(),
+                        value: record.value.to_vec(),
+                    })
+                    .collect();
+
+                Ok(records)
+            })();
+
+            match result {
+                Ok(records) => {
+                    self.records = records;
+                    self.record_idx = 0;
+                }
+                Err(err) => {
+                    self.finished = true;
+                    return Some(Err(err));
+                }
+            }
+        }
+    }
 }
