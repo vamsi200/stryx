@@ -22,27 +22,30 @@ fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let mut table = TableBuilder::create("test.stryx", TableOptions::default())?;
-    // let records = random_records(10);
-    // let keys: Vec<_> = records.iter().step_by(1).map(|r| r.key.to_vec()).collect();
+    let records = random_records(100_000);
+    let keys: Vec<_> = records.iter().step_by(1).map(|r| r.key.to_vec()).collect();
 
-    table.add(&[1u8], &[10u8])?;
-    table.add(&[1u8, 2], &[20u8])?;
-    table.add(&[1u8, 4], &[20u8])?;
-    table.add(&[1u8, 5], &[20u8])?;
-    table.add(&[2u8, 5], &[20u8])?;
-    table.add(&[3u8, 5], &[20u8])?;
+    // table.add(&[1u8], &[10u8])?;
+    // table.add(&[1u8, 2], &[20u8])?;
+    // table.add(&[1u8, 4], &[20u8])?;
+    // table.add(&[1u8, 5], &[20u8])?;
+    // table.add(&[2u8, 5], &[20u8])?;
+    // table.add(&[3u8, 5], &[20u8])?;
 
-    // table.add_batch(records);
-    table.finalize()?;
+    println!("starting..");
+    table.add_batch(records);
+    println!("{:#?}", table.statistics());
+
+    println!("{:#?}", table.finalize()?);
 
     let mut reader = TableReader::open("test.stryx")?;
 
     let start = Instant::now();
 
-    for s in reader.prefix(&[1u8])? {
-        let s = s?;
-        println!("{s:?}");
-    }
+    // for s in reader.prefix(&[1u8])? {
+    //     let s = s?;
+    //     println!("{s:?}");
+    // }
 
     // println!(
     //     "{:?}",

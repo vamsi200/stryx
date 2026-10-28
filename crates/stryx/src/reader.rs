@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     FOOTER_SIZE, MAGIC, VERSION,
-    builder::{DataBlock, Record, RecordReader},
+    builder::{DataBlock, Record, RecordReader, TableMetadata},
     decoder::Decoder,
     error::{DecodeError, StryxError},
     index::IndexEntry,
@@ -256,10 +256,6 @@ impl TableReader {
 }
 
 pub struct ReaderOptions {
-    // TODO
-}
-
-pub struct TableMetadata {
     // TODO
 }
 

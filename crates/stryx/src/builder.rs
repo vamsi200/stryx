@@ -150,6 +150,18 @@ pub struct TableBuilder<W: Write> {
 
     /// Offset of a block
     offset: u64,
+
+    /// Min Key in the table
+    min_key: Option<Vec<u8>>,
+
+    /// Max key in the table
+    max_key: Option<Vec<u8>>,
+
+    /// Block count
+    block_count: u32,
+
+    /// Total record count
+    record_count: u64,
 }
 
 impl TableBuilder<BufWriter<File>> {
@@ -170,6 +182,10 @@ impl TableBuilder<BufWriter<File>> {
             last_key: None,
             block_first_key: None,
             offset: 0,
+            min_key: None,
+            max_key: None,
+            block_count: 0,
+            record_count: 0,
         })
     }
 }
@@ -185,6 +201,10 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             last_key: None,
             block_first_key: None,
             offset: 0,
+            min_key: None,
+            max_key: None,
+            block_count: 0,
+            record_count: 0,
         })
     }
 
@@ -202,6 +222,14 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         }
 
         let record = Record { key, value };
+        self.record_count += 1;
+
+        if self.min_key.is_none() {
+            self.min_key = Some(key.to_vec());
+        }
+
+        self.max_key = Some(key.to_vec());
+
         let encoded_record = record.encode_record()?;
 
         // Include the additional u32 offset for the incoming record
@@ -244,8 +272,10 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         );
 
         self.offset += encoded_block.len() as u64;
+        self.block_count += 1;
 
         self.block.clear();
+        self.block_first_key = None;
 
         Ok(())
     }
@@ -263,7 +293,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
     /// Flush remaining blocks, write index and footer, finalize file
     /// and return the metadata about completed table.
-    pub fn finalize(mut self) -> Result<(), StryxError> {
+    pub fn finalize(mut self) -> Result<TableMetadata, StryxError> {
         self.flush_block()?;
 
         // Encode sparse index
@@ -283,13 +313,34 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.writer.flush()?;
 
-        Ok(())
+        let file_size = index_offset + index_size + 28;
+
+        Ok(TableMetadata {
+            record_count: self.record_count,
+            block_count: self.block_count,
+            file_size,
+            min_key: self.min_key,
+            max_key: self.max_key,
+            index_offset,
+            index_size,
+        })
     }
 
     /// Return current write statistics
-    pub fn statistics(&self) {
-        todo!()
+    pub fn statistics(&self) -> WriteStatistics {
+        WriteStatistics {
+            record_count: self.record_count,
+            blocks_written: self.block_count,
+            bytes_written: self.offset,
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteStatistics {
+    pub record_count: u64,
+    pub blocks_written: u32,
+    pub bytes_written: u64,
 }
 
 #[derive(Debug, Clone)]
