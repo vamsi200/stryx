@@ -225,6 +225,7 @@ impl TableReader {
             end_key: Some(end.to_vec()),
             prefix: None,
             finished: false,
+            stop_after_current_block: false,
         })
     }
 
@@ -239,6 +240,7 @@ impl TableReader {
             end_key: None,
             prefix: Some(prefix.to_vec()),
             finished: false,
+            stop_after_current_block: false,
         })
     }
 
@@ -279,6 +281,7 @@ pub struct TableIterator<'a> {
     start_key: Option<Vec<u8>>,
     end_key: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
+    stop_after_current_block: bool,
     finished: bool,
 }
 
@@ -293,6 +296,7 @@ impl<'a> TableIterator<'a> {
             end_key: None,
             prefix: None,
             finished: false,
+            stop_after_current_block: false,
         }
     }
 }
@@ -336,6 +340,12 @@ impl Iterator for TableIterator<'_> {
                 return Some(Ok(record));
             }
 
+            // return early if cur key is greater than prefix
+            if self.stop_after_current_block {
+                self.finished = true;
+                return None;
+            }
+
             if self.block_idx >= self.reader.index.len() {
                 self.finished = true;
                 return None;
@@ -365,13 +375,21 @@ impl Iterator for TableIterator<'_> {
                     })
                     .unwrap_or(0);
 
-                let records: Vec<OwnedRecord> = block_reader.records[start_pos..]
-                    .iter()
-                    .take_while(|record| {
-                        self.prefix
-                            .as_ref()
-                            .is_none_or(|prefix| record.key.starts_with(prefix))
+                let records_slice = &block_reader.records[start_pos..];
+
+                let end_pos = self
+                    .prefix
+                    .as_ref()
+                    .map(|prefix| {
+                        records_slice.partition_point(|record| record.key.starts_with(prefix))
                     })
+                    .unwrap_or(records_slice.len());
+
+                let prefix_finished = self.prefix.is_some() && end_pos < records_slice.len();
+                self.stop_after_current_block = prefix_finished;
+
+                let records: Vec<OwnedRecord> = records_slice[..end_pos]
+                    .iter()
                     .map(|record| OwnedRecord {
                         key: record.key.to_vec(),
                         value: record.value.to_vec(),
