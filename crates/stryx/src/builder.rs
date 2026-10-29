@@ -9,8 +9,9 @@ use std::{
 use anyhow::Context;
 
 use crate::{
-    BLOCK_SIZE, MAGIC, VERSION,
+    BLOCK_SIZE, FOOTER_SIZE, MAGIC, VERSION,
     config::{DuplicatePolicy, KeyOrder, TableOptions},
+    decoder::Decoder,
     error::{DecodeError, StryxError},
     index::{IndexBuilder, IndexEntry},
 };
@@ -302,8 +303,25 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         // index block
         let index_offset = self.offset;
         let index_size = u64::try_from(encoded_index.len())?;
+        let file_size = index_offset + index_size + 28;
+
+        let mut table_metadata = TableMetadata {
+            record_count: self.record_count,
+            block_count: self.block_count,
+            file_size: 0,
+            min_key: self.min_key,
+            max_key: self.max_key,
+            index_offset,
+            index_size,
+        };
+
+        table_metadata.file_size = index_offset
+        + index_size + u64::try_from(table_metadata.len())?
+        + 8 // trailing metadata length
+        + FOOTER_SIZE as u64;
 
         self.writer.write_all(&encoded_index)?;
+        self.writer.write_all(&table_metadata.encode()?)?;
 
         // footer
         self.writer.write_all(&index_offset.to_le_bytes())?;
@@ -313,17 +331,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.writer.flush()?;
 
-        let file_size = index_offset + index_size + 28;
-
-        Ok(TableMetadata {
-            record_count: self.record_count,
-            block_count: self.block_count,
-            file_size,
-            min_key: self.min_key,
-            max_key: self.max_key,
-            index_offset,
-            index_size,
-        })
+        Ok(table_metadata)
     }
 
     /// Return current write statistics
@@ -365,6 +373,64 @@ pub struct TableMetadata {
 
     /// Encoded index size in bytes.
     pub index_size: u64,
+}
+
+impl TableMetadata {
+    fn len(&self) -> usize {
+        size_of::<u64>() // record_count
+        + size_of::<u32>() // block_count
+        + size_of::<u64>() // file_size
+        + size_of::<u64>() // min_key length
+        + self.min_key.as_ref().map_or(0, Vec::len)
+        + size_of::<u64>() // max_key length
+        + self.max_key.as_ref().map_or(0, Vec::len)
+        + size_of::<u64>() // index_offset
+        + size_of::<u64>() // index_size
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StryxError> {
+        let mut out = vec![];
+        out.extend(self.record_count.to_le_bytes());
+        out.extend(self.block_count.to_le_bytes());
+        out.extend(self.file_size.to_le_bytes());
+
+        let min_key_size = u64::try_from(self.min_key.as_ref().map(|val| val.len()).unwrap_or(0))?;
+        out.extend(min_key_size.to_le_bytes());
+        out.extend(self.min_key.as_deref().unwrap_or(&[]));
+
+        let max_key_size = u64::try_from(self.max_key.as_ref().map(|val| val.len()).unwrap_or(0))?;
+        out.extend(max_key_size.to_le_bytes());
+        out.extend(self.max_key.as_deref().unwrap_or(&[]));
+
+        out.extend(self.index_offset.to_le_bytes());
+        out.extend(self.index_size.to_le_bytes());
+
+        out.extend(u64::try_from(self.len())?.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<TableMetadata, StryxError> {
+        let mut decoder = Decoder::new(data);
+        let record_count = decoder.read_u64()?;
+        let block_count = decoder.read_u32()?;
+        let file_size = decoder.read_u64()?;
+        let min_key_size = decoder.read_u64()? as usize;
+        let min_key = decoder.read_bytes(min_key_size)?;
+        let max_key_size = decoder.read_u64()? as usize;
+        let max_key = decoder.read_bytes(max_key_size)?;
+        let index_offset = decoder.read_u64()?;
+        let index_size = decoder.read_u64()?;
+
+        Ok(TableMetadata {
+            record_count,
+            block_count,
+            file_size,
+            min_key: Some(min_key.to_vec()),
+            max_key: Some(max_key.to_vec()),
+            index_offset,
+            index_size,
+        })
+    }
 }
 
 /// # Data Block Format

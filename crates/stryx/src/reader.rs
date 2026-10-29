@@ -85,6 +85,7 @@ impl<'a> BlockReader<'a> {
 pub struct TableReader {
     file: File,
     index: Vec<IndexEntry>,
+    metadata: TableMetadata,
 }
 
 impl TableReader {
@@ -106,6 +107,22 @@ impl TableReader {
         let index_size = decoder.read_u64()?;
         let version = decoder.read_u32()?;
 
+        // metadata starts right afer encoded_index, so offset is just:
+        let metadata_offset = index_offset + index_size;
+        let file_size = file.metadata()?.len();
+
+        // (total file size - FOOTER_SIZE) gives end of metadata's position
+        // metadata size = Total File Size - FOOTER_SIZE - metadata_offset
+        let metadata_size = file_size
+            .checked_sub(metadata_offset + FOOTER_SIZE as u64)
+            .ok_or(StryxError::InvalidRange)?;
+
+        file.seek(std::io::SeekFrom::Start(metadata_offset))?;
+        let metadata_len = usize::try_from(metadata_size)?;
+        let mut metadata_buf = vec![0u8; metadata_len];
+        file.read_exact(&mut metadata_buf)?;
+        let metadata = TableMetadata::decode(&metadata_buf)?;
+
         if version != VERSION {
             return Err(StryxError::InvalidVersion);
         }
@@ -119,7 +136,7 @@ impl TableReader {
             return Err(DecodeError::Truncated.into());
         }
 
-        // Last 8 bytes contain count and checksum
+        // Last 8 bytes contain index count and checksum
         let entries_end = index_buf.len() - 8;
         let mut decoder = Decoder::new(&index_buf[..entries_end]);
 
@@ -148,6 +165,7 @@ impl TableReader {
         Ok(TableReader {
             file,
             index: index_entries,
+            metadata,
         })
     }
 
@@ -246,7 +264,7 @@ impl TableReader {
 
     /// Return table metadata
     pub fn metadata(&self) -> &TableMetadata {
-        todo!()
+        &self.metadata
     }
 
     /// Return runtime reader statistics

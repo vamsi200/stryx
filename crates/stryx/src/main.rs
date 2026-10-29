@@ -34,12 +34,13 @@ fn main() -> anyhow::Result<()> {
 
     println!("starting..");
     table.add_batch(records);
-    println!("{:#?}", table.statistics());
+    // table.statistics();
 
-    println!("{:#?}", table.finalize()?);
+    table.finalize()?;
 
     let mut reader = TableReader::open("test.stryx")?;
 
+    println!("{:#?}", reader.metadata());
     let start = Instant::now();
 
     // for s in reader.prefix(&[1u8])? {
