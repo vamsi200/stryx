@@ -4,6 +4,7 @@ pub mod decoder;
 pub mod error;
 pub mod index;
 pub mod reader;
+pub mod tests;
 
 pub const BLOCK_SIZE: usize = 16 * 1024;
 pub const FOOTER_SIZE: usize = 28;

@@ -29,12 +29,13 @@ pub struct TableOptions {
     pub restart_interval: usize,
 }
 
-#[derive(Default, Debug)]
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
-    None,
-    Lz4,
     #[default]
-    Zstd,
+    None = 0,
+    Lz4 = 1,
+    Zstd = 2,
 }
 
 #[derive(Default, Debug)]

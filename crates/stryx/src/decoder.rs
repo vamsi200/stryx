@@ -23,6 +23,13 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
 
+    pub fn read_u8(&mut self) -> Result<u8, StryxError> {
+        let bytes = self.read_bytes(1)?;
+        Ok(u8::from_le_bytes(
+            bytes.try_into().map_err(DecodeError::from)?,
+        ))
+    }
+
     pub fn read_u16(&mut self) -> Result<u16, StryxError> {
         let bytes = self.read_bytes(2)?;
         Ok(u16::from_le_bytes(

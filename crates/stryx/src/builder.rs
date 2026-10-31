@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use core::panic;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
@@ -10,7 +11,7 @@ use anyhow::Context;
 
 use crate::{
     BLOCK_SIZE, FOOTER_SIZE, MAGIC, VERSION,
-    config::{DuplicatePolicy, KeyOrder, TableOptions},
+    config::{Compression, DuplicatePolicy, KeyOrder, TableOptions},
     decoder::Decoder,
     error::{DecodeError, StryxError},
     index::{IndexBuilder, IndexEntry},
@@ -259,7 +260,13 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             return Ok(());
         }
 
-        let encoded_block = self.block.finish()?;
+        let encoded_block = match self.options.compression {
+            Compression::None => self.block.finish()?,
+            Compression::Zstd => zstd::encode_all(self.block.finish()?.as_slice(), 1)?,
+            Compression::Lz4 => {
+                panic!();
+            }
+        };
 
         let block_offset = self.offset;
         let block_size = u32::try_from(encoded_block.len())?;
@@ -313,6 +320,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             max_key: self.max_key,
             index_offset,
             index_size,
+            compression: self.options.compression,
         };
 
         table_metadata.file_size = index_offset
@@ -373,6 +381,9 @@ pub struct TableMetadata {
 
     /// Encoded index size in bytes.
     pub index_size: u64,
+
+    /// Compression used
+    pub compression: Compression,
 }
 
 impl TableMetadata {
@@ -390,6 +401,7 @@ impl TableMetadata {
 
     fn encode(&self) -> Result<Vec<u8>, StryxError> {
         let mut out = vec![];
+        out.extend((self.compression as u8).to_le_bytes());
         out.extend(self.record_count.to_le_bytes());
         out.extend(self.block_count.to_le_bytes());
         out.extend(self.file_size.to_le_bytes());
@@ -411,6 +423,7 @@ impl TableMetadata {
 
     pub fn decode(data: &[u8]) -> Result<TableMetadata, StryxError> {
         let mut decoder = Decoder::new(data);
+        let compression = decoder.read_u8()?;
         let record_count = decoder.read_u64()?;
         let block_count = decoder.read_u32()?;
         let file_size = decoder.read_u64()?;
@@ -421,7 +434,14 @@ impl TableMetadata {
         let index_offset = decoder.read_u64()?;
         let index_size = decoder.read_u64()?;
 
+        let compression = match compression {
+            1 => Compression::Lz4,
+            2 => Compression::Zstd,
+            _ => Compression::None,
+        };
+
         Ok(TableMetadata {
+            compression,
             record_count,
             block_count,
             file_size,

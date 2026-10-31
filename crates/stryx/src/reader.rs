@@ -10,6 +10,7 @@ use std::{
 use crate::{
     FOOTER_SIZE, MAGIC, VERSION,
     builder::{DataBlock, Record, RecordReader, TableMetadata},
+    config::Compression,
     decoder::Decoder,
     error::{DecodeError, StryxError},
     index::IndexEntry,
@@ -194,6 +195,14 @@ impl TableReader {
         self.file.seek(std::io::SeekFrom::Start(entry.offset))?;
         self.file.read_exact(&mut block_buf)?;
 
+        let block_buf = match self.metadata.compression {
+            Compression::None => block_buf,
+            Compression::Zstd => zstd::decode_all(block_buf.as_slice())?,
+            Compression::Lz4 => {
+                panic!();
+            }
+        };
+
         let reader = BlockReader::new(&block_buf)?;
         Ok(reader.get(key).and_then(|x| Some(x.0.to_vec())))
     }
@@ -233,6 +242,7 @@ impl TableReader {
             .partition_point(|entry| entry.first_key.as_slice() <= start);
 
         let block_idx = block.saturating_sub(1);
+        let compression = self.metadata.compression;
 
         Ok(TableIterator {
             reader: self,
@@ -244,11 +254,14 @@ impl TableReader {
             prefix: None,
             finished: false,
             stop_after_current_block: false,
+            compression,
         })
     }
 
     /// Iterate over keys sharing a prefix
     pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
+        let compression = self.metadata.compression;
+
         Ok(TableIterator {
             reader: self,
             block_idx: 0,
@@ -259,6 +272,7 @@ impl TableReader {
             prefix: Some(prefix.to_vec()),
             finished: false,
             stop_after_current_block: false,
+            compression,
         })
     }
 
@@ -277,8 +291,25 @@ pub struct ReaderOptions {
     // TODO
 }
 
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ReadStats {
-    // TODO
+    /// Number of data blocks read from the file.
+    pub blocks_read: u64,
+
+    /// Total bytes successfully read from the file.
+    pub bytes_read: u64,
+
+    /// Number of point lookup operations.
+    pub point_lookups: u64,
+
+    /// Number of successful point lookups.
+    pub point_hits: u64,
+
+    /// Number of unsuccessful point lookups.
+    pub point_misses: u64,
+
+    /// Number of checksum verification failures.
+    pub checksum_failures: u64,
 }
 
 #[derive(Debug)]
@@ -297,10 +328,12 @@ pub struct TableIterator<'a> {
     prefix: Option<Vec<u8>>,
     stop_after_current_block: bool,
     finished: bool,
+    compression: Compression,
 }
 
 impl<'a> TableIterator<'a> {
     fn new(reader: &'a mut TableReader) -> Self {
+        let compression = reader.metadata.compression;
         Self {
             reader,
             block_idx: 0,
@@ -311,6 +344,7 @@ impl<'a> TableIterator<'a> {
             prefix: None,
             finished: false,
             stop_after_current_block: false,
+            compression,
         }
     }
 }
@@ -327,16 +361,11 @@ impl Iterator for TableIterator<'_> {
             if self.record_idx < self.records.len() {
                 let record = &self.records[self.record_idx];
 
-                // return if end_key is some and is found or return early if key doesn't start with
-                // prefix..
+                // return if end_key is some and is found
                 if self
                     .end_key
                     .as_ref()
                     .is_some_and(|end| record.key.as_slice() >= end.as_slice())
-                    || self
-                        .prefix
-                        .as_ref()
-                        .is_some_and(|prefix| !record.key.starts_with(prefix))
                 {
                     self.finished = true;
                     return None;
@@ -375,6 +404,14 @@ impl Iterator for TableIterator<'_> {
                     .file
                     .seek(std::io::SeekFrom::Start(entry.offset))?;
                 self.reader.file.read_exact(&mut block_buf)?;
+
+                let block_buf = match self.compression {
+                    Compression::None => block_buf,
+                    Compression::Zstd => zstd::decode_all(block_buf.as_slice())?,
+                    Compression::Lz4 => {
+                        panic!();
+                    }
+                };
 
                 let block_reader = BlockReader::new(&block_buf)?;
 

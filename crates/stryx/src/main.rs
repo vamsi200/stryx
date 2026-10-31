@@ -40,13 +40,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut reader = TableReader::open("test.stryx")?;
 
-    println!("{:#?}", reader.metadata());
     let start = Instant::now();
 
-    // for s in reader.prefix(&[1u8])? {
-    //     let s = s?;
-    //     println!("{s:?}");
-    // }
+    for s in reader.prefix(&[1u8])? {
+        let s = s?;
+        println!("{s:?}");
+    }
 
     // println!(
     //     "{:?}",
