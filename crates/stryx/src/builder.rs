@@ -4,10 +4,13 @@ use core::panic;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
+    os::fd::OwnedFd,
     path::Path,
 };
 
 use anyhow::Context;
+use spillsort::Sorter;
+use zstd::zstd_safe::WriteBuf;
 
 use crate::{
     BLOCK_SIZE, FOOTER_SIZE, MAGIC, VERSION,
@@ -15,9 +18,10 @@ use crate::{
     decoder::Decoder,
     error::{DecodeError, StryxError},
     index::{IndexBuilder, IndexEntry},
+    reader::OwnedRecord,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Record<'a> {
     pub key: &'a [u8],
     pub value: &'a [u8],
@@ -42,6 +46,11 @@ struct Footer {
     pub index_size: u64,
     pub version: u16,
     pub magic_bytes: [u8; 8],
+}
+
+pub trait Encode {
+    fn encode_len(&self) -> usize;
+    fn encode_record(&self) -> Result<Vec<u8>, DecodeError>;
 }
 
 #[derive(Debug)]
@@ -125,15 +134,13 @@ impl Encode for Record<'_> {
     }
 }
 
-pub trait Encode {
-    fn encode_len(&self) -> usize;
-    fn encode_record(&self) -> Result<Vec<u8>, DecodeError>;
-}
-
 #[derive(Debug)]
 pub struct TableBuilder<W: Write> {
     /// Destination for the encoded SSTable
     writer: W,
+
+    /// Sorter for unsorted keys
+    sorter: Option<spillsort::Sorter>,
 
     /// Current data block being constructed
     block: BlockBuilder,
@@ -169,6 +176,13 @@ pub struct TableBuilder<W: Write> {
 impl TableBuilder<BufWriter<File>> {
     /// Create an SSTable at the given path
     pub fn create(path: impl AsRef<Path>, options: TableOptions) -> Result<Self, StryxError> {
+        let sorter = match options.key_order {
+            KeyOrder::Presorted => None,
+            KeyOrder::Lexicographic => Some(spillsort::Sorter::new(
+                spillsort::Config::default().max_bytes(64 * 1024 * 1024),
+            )?),
+        };
+
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -178,6 +192,7 @@ impl TableBuilder<BufWriter<File>> {
 
         Ok(Self {
             writer: BufWriter::new(file),
+            sorter,
             block: BlockBuilder::new(),
             index: IndexBuilder::new(),
             options,
@@ -195,8 +210,16 @@ impl TableBuilder<BufWriter<File>> {
 impl<'a, W: std::io::Write> TableBuilder<W> {
     /// Create an SSTable using a custom writer
     pub fn new(writer: W, options: TableOptions) -> Result<Self, StryxError> {
+        let sorter = match options.key_order {
+            KeyOrder::Presorted => None,
+            KeyOrder::Lexicographic => Some(spillsort::Sorter::new(
+                spillsort::Config::default().max_bytes(64 * 1024 * 1024),
+            )?),
+        };
+
         Ok(Self {
             writer,
+            sorter,
             block: BlockBuilder::new(),
             index: IndexBuilder::new(),
             options,
@@ -210,8 +233,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         })
     }
 
-    /// Append a record
-    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
+    fn write_record(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
         // Validate global key ordering
         if let Some(last_key) = self.last_key.as_deref() {
             if key < last_key {
@@ -254,17 +276,37 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         Ok(())
     }
 
+    /// Append a record
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
+        if let Some(sorter) = &mut self.sorter {
+            sorter.push(key, value)?;
+            return Ok(());
+        }
+
+        self.write_record(key, value)?;
+        Ok(())
+    }
+
     // Construct the block and flush it
     fn flush_block(&mut self) -> Result<(), StryxError> {
         if self.block.is_empty() {
             return Ok(());
         }
 
+        let block = self.block.finish()?;
+
         let encoded_block = match self.options.compression {
-            Compression::None => self.block.finish()?,
-            Compression::Zstd => zstd::encode_all(self.block.finish()?.as_slice(), 1)?,
+            Compression::None => block,
+            Compression::Zstd => zstd::encode_all(block.as_slice(), 1)?,
             Compression::Lz4 => {
-                panic!();
+                let mut encoder = lz4::EncoderBuilder::new().level(4).build(Vec::new())?;
+
+                encoder.write_all(&block)?;
+
+                let (output, result) = encoder.finish();
+                result?;
+
+                output
             }
         };
 
@@ -302,6 +344,14 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
     /// Flush remaining blocks, write index and footer, finalize file
     /// and return the metadata about completed table.
     pub fn finalize(mut self) -> Result<TableMetadata, StryxError> {
+        if let Some(sorter) = self.sorter.take() {
+            let mut sorted = sorter.finish()?;
+
+            while let Some((key, value)) = sorted.next_record()? {
+                self.write_record(&key, &value)?;
+            }
+        }
+
         self.flush_block()?;
 
         // Encode sparse index

@@ -49,4 +49,7 @@ pub enum StryxError {
 
     #[error("Invalid Range")]
     InvalidRange,
+
+    #[error("{0}")]
+    SplillSortError(#[from] spillsort::Error),
 }

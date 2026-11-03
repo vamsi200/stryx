@@ -87,6 +87,7 @@ pub struct TableReader {
     file: File,
     index: Vec<IndexEntry>,
     metadata: TableMetadata,
+    readstats: ReadStats,
 }
 
 impl TableReader {
@@ -119,9 +120,11 @@ impl TableReader {
             .ok_or(StryxError::InvalidRange)?;
 
         file.seek(std::io::SeekFrom::Start(metadata_offset))?;
+
         let metadata_len = usize::try_from(metadata_size)?;
         let mut metadata_buf = vec![0u8; metadata_len];
         file.read_exact(&mut metadata_buf)?;
+
         let metadata = TableMetadata::decode(&metadata_buf)?;
 
         if version != VERSION {
@@ -130,6 +133,7 @@ impl TableReader {
 
         let index_len = usize::try_from(index_size)?;
         let mut index_buf = vec![0u8; index_len];
+
         file.seek(std::io::SeekFrom::Start(index_offset))?;
         file.read_exact(&mut index_buf)?;
 
@@ -137,11 +141,12 @@ impl TableReader {
             return Err(DecodeError::Truncated.into());
         }
 
-        // Last 8 bytes contain index count and checksum
+        // Last 8 bytes contain index count and checksum.
         let entries_end = index_buf.len() - 8;
-        let mut decoder = Decoder::new(&index_buf[..entries_end]);
 
+        let mut decoder = Decoder::new(&index_buf[..entries_end]);
         let mut trailer = Decoder::new(&index_buf[entries_end..]);
+
         let count = trailer.read_u32()?;
         let stored_checksum = trailer.read_u32()?;
 
@@ -153,13 +158,13 @@ impl TableReader {
         }
 
         let mut index_entries = Vec::new();
+
         for _ in 0..count {
             index_entries.push(IndexEntry::decode(&mut decoder)?);
         }
 
         // Reject unexpected trailing bytes in the entry region.
         if decoder.remaining() != 0 {
-            println!("Remaining: {}", decoder.remaining());
             return Err(DecodeError::InvalidLength.into());
         }
 
@@ -167,16 +172,14 @@ impl TableReader {
             file,
             index: index_entries,
             metadata,
+            readstats: ReadStats::default(),
         })
     }
 
-    /// Open with configurable read behavior
-    pub fn open_with_options(path: &str, config: ReaderOptions) -> Result<Self, StryxError> {
-        todo!()
-    }
-
-    /// Find the value associated with a key
+    /// Find the value associated with a key.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
+        self.readstats.point_lookups += 1;
+
         // find the first index entry whose first_key is greater than requested
         // key, the preceeding block could have key
         let block = self
@@ -184,54 +187,77 @@ impl TableReader {
             .partition_point(|entry| entry.first_key.as_slice() <= key);
 
         if block == 0 {
+            self.readstats.point_misses += 1;
             return Ok(None);
         }
 
         // since returned block's first_key is greater than the requested key,
         // the requested key `could be` in previous one
-        let entry = &self.index[block - 1];
+        let (offset, size) = {
+            let entry = &self.index[block - 1];
+            (entry.offset, entry.size)
+        };
 
-        let mut block_buf = vec![0u8; entry.size as usize];
-        self.file.seek(std::io::SeekFrom::Start(entry.offset))?;
+        let mut block_buf = vec![0u8; size as usize];
+
+        self.file.seek(std::io::SeekFrom::Start(offset))?;
         self.file.read_exact(&mut block_buf)?;
 
-        let block_buf = match self.metadata.compression {
-            Compression::None => block_buf,
-            Compression::Zstd => zstd::decode_all(block_buf.as_slice())?,
-            Compression::Lz4 => {
-                panic!();
+        self.readstats.blocks_read += 1;
+        self.readstats.bytes_read += u64::from(size);
+
+        let (block_buf, decompressed) = decompress_block(self.metadata.compression, block_buf)?;
+
+        if decompressed {
+            self.readstats.blocks_decompressed += 1;
+            self.readstats.bytes_decompressed += block_buf.len() as u64;
+        }
+
+        let reader = match BlockReader::new(&block_buf) {
+            Ok(reader) => reader,
+            Err(err) => {
+                if matches!(&err, StryxError::InvalidChecksum) {
+                    self.readstats.checksum_failures += 1;
+                }
+
+                return Err(err);
             }
         };
 
-        let reader = BlockReader::new(&block_buf)?;
-        Ok(reader.get(key).and_then(|x| Some(x.0.to_vec())))
-    }
+        let result = reader.get(key).map(|x| x.0.to_vec());
 
-    /// Check whether a key exists
-    pub fn contains_key(&mut self, key: &[u8]) -> Result<bool, StryxError> {
-        if self.get(key)?.is_some() {
-            return Ok(true);
+        if result.is_some() {
+            self.readstats.point_hits += 1;
+        } else {
+            self.readstats.point_misses += 1;
         }
 
-        Ok(false)
+        Ok(result)
     }
 
-    /// Batch point lookups
+    /// Check whether a key exists.
+    pub fn contains_key(&mut self, key: &[u8]) -> Result<bool, StryxError> {
+        Ok(self.get(key)?.is_some())
+    }
+
+    /// Batch point lookups.
     pub fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StryxError> {
-        let mut out = vec![];
+        let mut out = Vec::with_capacity(keys.len());
+
         for key in keys {
-            out.push(self.get(*key)?);
+            out.push(self.get(key)?);
         }
 
         Ok(out)
     }
 
-    /// Iterate over all records in sorted order
+    /// Iterate over all records in sorted order.
     pub fn iter(&mut self) -> impl Iterator<Item = Result<OwnedRecord, StryxError>> + '_ {
+        self.readstats.iter_queries += 1;
         TableIterator::new(self)
     }
 
-    /// Iterate over a bounded key range
+    /// Iterate over a bounded key range.
     pub fn range(&mut self, start: &[u8], end: &[u8]) -> Result<TableIterator<'_>, StryxError> {
         if start >= end {
             return Err(StryxError::InvalidRange);
@@ -243,6 +269,8 @@ impl TableReader {
 
         let block_idx = block.saturating_sub(1);
         let compression = self.metadata.compression;
+
+        self.readstats.range_queries += 1;
 
         Ok(TableIterator {
             reader: self,
@@ -258,9 +286,11 @@ impl TableReader {
         })
     }
 
-    /// Iterate over keys sharing a prefix
+    /// Iterate over keys sharing a prefix.
     pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
         let compression = self.metadata.compression;
+
+        self.readstats.prefix_queries += 1;
 
         Ok(TableIterator {
             reader: self,
@@ -276,28 +306,54 @@ impl TableReader {
         })
     }
 
-    /// Return table metadata
+    /// Return table metadata.
     pub fn metadata(&self) -> &TableMetadata {
         &self.metadata
     }
 
-    /// Return runtime reader statistics
+    /// Return runtime reader statistics.
     pub fn stats(&self) -> ReadStats {
-        todo!()
+        self.readstats
     }
 }
 
-pub struct ReaderOptions {
-    // TODO
+/// Decompress a data block.
+///
+/// Returns the decoded bytes and whether decompression was performed.
+fn decompress_block(
+    compression: Compression,
+    block_buf: Vec<u8>,
+) -> Result<(Vec<u8>, bool), StryxError> {
+    match compression {
+        Compression::None => Ok((block_buf, false)),
+        Compression::Zstd => Ok((zstd::decode_all(block_buf.as_slice())?, true)),
+        Compression::Lz4 => {
+            let mut decoder = lz4::Decoder::new(block_buf.as_slice())?;
+
+            let mut output = Vec::new();
+            decoder.read_to_end(&mut output)?;
+
+            let (_, result) = decoder.finish();
+            result?;
+
+            Ok((output, true))
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadStats {
-    /// Number of data blocks read from the file.
+    /// Number of data blocks successfully read from the file.
     pub blocks_read: u64,
 
-    /// Total bytes successfully read from the file.
+    /// Total compressed/on-disk data bytes successfully read.
     pub bytes_read: u64,
+
+    /// Number of blocks successfully decompressed.
+    pub blocks_decompressed: u64,
+
+    /// Total uncompressed bytes produced by decompression.
+    pub bytes_decompressed: u64,
 
     /// Number of point lookup operations.
     pub point_lookups: u64,
@@ -310,6 +366,15 @@ pub struct ReadStats {
 
     /// Number of checksum verification failures.
     pub checksum_failures: u64,
+
+    /// Number of prefix queries.
+    pub prefix_queries: u64,
+
+    /// Number of range queries.
+    pub range_queries: u64,
+
+    /// Number of full-table iteration queries.
+    pub iter_queries: u64,
 }
 
 #[derive(Debug)]
@@ -334,6 +399,7 @@ pub struct TableIterator<'a> {
 impl<'a> TableIterator<'a> {
     fn new(reader: &'a mut TableReader) -> Self {
         let compression = reader.metadata.compression;
+
         Self {
             reader,
             block_idx: 0,
@@ -380,6 +446,7 @@ impl Iterator for TableIterator<'_> {
                 );
 
                 self.record_idx += 1;
+
                 return Some(Ok(record));
             }
 
@@ -394,24 +461,29 @@ impl Iterator for TableIterator<'_> {
                 return None;
             }
 
-            let entry = &self.reader.index[self.block_idx];
+            let (offset, size) = {
+                let entry = &self.reader.index[self.block_idx];
+                (entry.offset, entry.size)
+            };
+
             self.block_idx += 1;
 
-            let mut block_buf = vec![0u8; entry.size as usize];
+            let mut block_buf = vec![0u8; size as usize];
 
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
-                self.reader
-                    .file
-                    .seek(std::io::SeekFrom::Start(entry.offset))?;
+                self.reader.file.seek(std::io::SeekFrom::Start(offset))?;
+
                 self.reader.file.read_exact(&mut block_buf)?;
 
-                let block_buf = match self.compression {
-                    Compression::None => block_buf,
-                    Compression::Zstd => zstd::decode_all(block_buf.as_slice())?,
-                    Compression::Lz4 => {
-                        panic!();
-                    }
-                };
+                self.reader.readstats.blocks_read += 1;
+                self.reader.readstats.bytes_read += u64::from(size);
+
+                let (block_buf, decompressed) = decompress_block(self.compression, block_buf)?;
+
+                if decompressed {
+                    self.reader.readstats.blocks_decompressed += 1;
+                    self.reader.readstats.bytes_decompressed += block_buf.len() as u64;
+                }
 
                 let block_reader = BlockReader::new(&block_buf)?;
 
@@ -437,6 +509,7 @@ impl Iterator for TableIterator<'_> {
                     .unwrap_or(records_slice.len());
 
                 let prefix_finished = self.prefix.is_some() && end_pos < records_slice.len();
+
                 self.stop_after_current_block = prefix_finished;
 
                 let records: Vec<OwnedRecord> = records_slice[..end_pos]
@@ -455,7 +528,12 @@ impl Iterator for TableIterator<'_> {
                     self.records = records;
                     self.record_idx = 0;
                 }
+
                 Err(err) => {
+                    if matches!(&err, StryxError::InvalidChecksum) {
+                        self.reader.readstats.checksum_failures += 1;
+                    }
+
                     self.finished = true;
                     return Some(Err(err));
                 }

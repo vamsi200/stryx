@@ -1,13 +1,17 @@
 #![allow(unused)]
 
+use core::panic;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::builder::TableBuilder;
-use crate::config::TableOptions;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+
+use crate::builder::{Record, TableBuilder};
+use crate::config::{Compression, TableOptions};
 use crate::error::StryxError;
-use crate::reader::TableReader;
+use crate::reader::{OwnedRecord, TableReader};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -343,5 +347,199 @@ fn test_binary_keys() -> TestResult {
     assert_eq!(records[2].key, vec![0x00, 0xFF]);
 
     std::fs::remove_file(path)?;
+    Ok(())
+}
+
+pub fn random_records(n: usize, sorted: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let mut records: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+        .map(|_| {
+            let key_len = rng.random_range(4..16);
+            let val_len = rng.random_range(8..64);
+
+            let key = (0..key_len).map(|_| rng.random()).collect();
+            let value = (0..val_len).map(|_| rng.random()).collect();
+
+            (key, value)
+        })
+        .collect();
+
+    if sorted {
+        records.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    let (keys, values): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+
+    (keys, values)
+}
+
+#[test]
+fn test_compression() -> TestResult {
+    let (keys, values) = random_records(1000, true);
+
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+        let path = test_path();
+
+        let options = TableOptions {
+            compression,
+            ..TableOptions::default()
+        };
+
+        let mut table = TableBuilder::create(&path, options)?;
+
+        let records: Vec<Record<'_>> = keys
+            .iter()
+            .zip(&values)
+            .map(|(key, value)| Record { key, value })
+            .collect();
+
+        let record_count = records.len();
+        table.add_batch(records);
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+
+        assert_eq!(
+            reader.metadata().record_count,
+            record_count as u64,
+            "Record count mismatch with {compression:?}"
+        );
+
+        for (key, value) in keys.iter().zip(&values) {
+            assert_eq!(
+                reader.get(key)?,
+                Some(value.clone()),
+                "get() mismatch with {compression:?}: {key:?}"
+            );
+
+            assert!(
+                reader.contains_key(key)?,
+                "contains_key() failed with {compression:?}: {key:?}"
+            );
+        }
+
+        for key in [b"__missing_key__".as_slice(), b"not_a_real_record", b""] {
+            assert_eq!(
+                reader.get(key)?,
+                None,
+                "Unexpected get() result with {compression:?}: {key:?}"
+            );
+
+            assert!(
+                !reader.contains_key(key)?,
+                "Unexpected contains_key() result with {compression:?}: {key:?}"
+            );
+        }
+
+        for (key, value) in keys.iter().zip(&values).take(100) {
+            if key.is_empty() {
+                continue;
+            }
+
+            let prefix = &key[..1];
+
+            let actual: Vec<_> = reader
+                .prefix(prefix)?
+                .map(|r| r.map(|rec| (rec.key, rec.value)))
+                .collect::<Result<_, _>>()?;
+
+            let expected: Vec<_> = keys
+                .iter()
+                .zip(&values)
+                .filter(|(k, _)| k.starts_with(prefix))
+                .collect();
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "prefix() result count mismatch with {compression:?}: {prefix:?}"
+            );
+
+            for ((actual_key, actual_value), (expected_key, expected_value)) in
+                actual.iter().zip(expected)
+            {
+                assert_eq!(
+                    actual_key, expected_key,
+                    "prefix() key mismatch with {compression:?}"
+                );
+
+                assert_eq!(
+                    actual_value, expected_value,
+                    "prefix() value mismatch with {compression:?}"
+                );
+            }
+
+            assert!(
+                actual.iter().any(|(k, v)| k == key && v == value),
+                "prefix() missed {key:?} with {compression:?}"
+            );
+        }
+
+        assert!(
+            std::fs::metadata(&path)?.len() > 0,
+            "Empty SSTable with {compression:?}"
+        );
+
+        drop(reader);
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_lexicographic_key_order() -> Result<(), StryxError> {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.key_order = crate::config::KeyOrder::Lexicographic;
+    options.compression = Compression::None;
+
+    let (keys, values) = random_records(1000, false);
+
+    let records: Vec<Record<'_>> = keys
+        .iter()
+        .zip(&values)
+        .map(|(key, value)| Record { key, value })
+        .collect();
+
+    assert!(
+        records.windows(2).any(|w| w[0].key > w[1].key),
+        "Test data unexpectedly sorted"
+    );
+
+    let expected_count = records.len();
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add_batch(records)?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.metadata().record_count, expected_count as u64);
+
+    let actual: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(actual.len(), expected_count);
+
+    for pair in actual.windows(2) {
+        assert!(
+            pair[0].key <= pair[1].key,
+            "Keys are not lexicographically sorted"
+        );
+    }
+
+    for (key, value) in keys.iter().zip(&values) {
+        let actual_value = reader.get(key)?;
+
+        assert_eq!(
+            actual_value.as_deref(),
+            Some(value.as_slice()),
+            "Value mismatch for key"
+        );
+    }
+
     Ok(())
 }

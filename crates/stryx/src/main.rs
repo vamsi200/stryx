@@ -8,11 +8,13 @@ use std::{
 
 use anyhow::Context;
 use rand::{RngExt, rng};
+use spillsort::{Config, Sorter};
 use stryx::{
     builder::{Record, RecordReader, TableBuilder},
-    config::TableOptions,
+    config::{Compression, TableOptions},
     error::DecodeError,
     reader::TableReader,
+    tests::random_records,
 };
 
 fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
@@ -21,31 +23,43 @@ fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut table = TableBuilder::create("test.stryx", TableOptions::default())?;
-    let records = random_records(100_000);
-    let keys: Vec<_> = records.iter().step_by(1).map(|r| r.key.to_vec()).collect();
+    let table_options = TableOptions {
+        compression: Compression::Lz4,
+        key_order: stryx::config::KeyOrder::Lexicographic,
+        ..TableOptions::default()
+    };
 
-    // table.add(&[1u8], &[10u8])?;
-    // table.add(&[1u8, 2], &[20u8])?;
-    // table.add(&[1u8, 4], &[20u8])?;
-    // table.add(&[1u8, 5], &[20u8])?;
-    // table.add(&[2u8, 5], &[20u8])?;
-    // table.add(&[3u8, 5], &[20u8])?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("lz4.stryx")?;
+
+    let mut table = TableBuilder::new(file, table_options)?;
+
+    let (keys, values) = random_records(1_000_000, true);
+
+    let records: Vec<Record<'_>> = keys
+        .iter()
+        .zip(&values)
+        .map(|(key, value)| Record { key, value })
+        .collect();
 
     println!("starting..");
-    table.add_batch(records);
-    // table.statistics();
 
+    table.add_batch(records);
     table.finalize()?;
 
-    let mut reader = TableReader::open("test.stryx")?;
+    let mut reader = TableReader::open("lz4.stryx")?;
 
     let start = Instant::now();
 
     for s in reader.prefix(&[1u8])? {
-        let s = s?;
-        println!("{s:?}");
+        // let s = s?;
+        // println!("{s:?}");
     }
+
+    println!("{:#?}", reader.stats());
 
     // println!(
     //     "{:?}",
@@ -78,45 +92,4 @@ fn main() -> anyhow::Result<()> {
 
     // println!("elapsed: {:?}", start.elapsed());
     Ok(())
-}
-
-fn random_records(n: usize) -> Vec<Record<'static>> {
-    let mut rng = rand::rng();
-    let mut records: Vec<Record<'static>> = (0..n)
-        .map(|_| {
-            let key_len = rng.random_range(4..16);
-            let val_len = rng.random_range(8..64);
-            let key: Vec<u8> = (0..key_len).map(|_| rng.random()).collect();
-            let value: Vec<u8> = (0..val_len).map(|_| rng.random()).collect();
-            let key: &'static [u8] = Box::leak(key.into_boxed_slice());
-            let value: &'static [u8] = Box::leak(value.into_boxed_slice());
-
-            Record { key, value }
-        })
-        .collect();
-
-    records.sort_unstable_by(|a, b| a.key.cmp(b.key));
-    records
-}
-
-#[cfg(test)]
-mod tests {
-    use stryx::builder::Encode;
-
-    use super::*;
-
-    #[test]
-    fn test_decode() {
-        let mut output = Vec::new();
-        for record in random_records(10) {
-            record.encode_record();
-        }
-
-        let mut record_reader = RecordReader::new(&output);
-
-        while let Some(record) = record_reader.next_record().unwrap() {
-            assert!(record.key.len() > 0);
-            assert!(record.value.len() > 0);
-        }
-    }
 }

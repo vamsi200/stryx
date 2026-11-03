@@ -51,9 +51,13 @@ pub enum IndexType {
     Sparse,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOrder {
+    /// Require records to already be lexicographically sorted.
     #[default]
+    Presorted,
+
+    /// Sort records lexicographically before writing.
     Lexicographic,
 }
 
