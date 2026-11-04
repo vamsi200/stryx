@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 use core::panic;
+use std::assert_matches;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+use crate::VERSION;
 use crate::builder::{Record, TableBuilder};
-use crate::config::{Compression, TableOptions};
+use crate::config::{Compression, DuplicatePolicy, KeyOrder, TableOptions};
 use crate::error::StryxError;
 use crate::reader::{OwnedRecord, TableReader};
 
@@ -205,7 +207,7 @@ fn test_iteration_blocks() -> TestResult {
         table.add(key.as_bytes(), value.as_bytes())?;
     }
 
-    let metadata = table.finalize()?;
+    let (metadata, _) = table.finalize()?;
 
     assert_eq!(metadata.record_count, 10_000);
     assert!(metadata.block_count > 1);
@@ -245,7 +247,7 @@ fn test_duplicate_keys() -> TestResult {
 
     table.add(b"banana", b"third")?;
 
-    let metadata = table.finalize()?;
+    let (metadata, _) = table.finalize()?;
     assert_eq!(metadata.record_count, 2);
 
     std::fs::remove_file(path)?;
@@ -267,7 +269,7 @@ fn test_unsorted_keys() -> TestResult {
 
     table.add(b"cherry", b"third")?;
 
-    let metadata = table.finalize()?;
+    let (metadata, _) = table.finalize()?;
     assert_eq!(metadata.record_count, 2);
 
     std::fs::remove_file(path)?;
@@ -541,5 +543,374 @@ fn test_lexicographic_key_order() -> Result<(), StryxError> {
         );
     }
 
+    Ok(())
+}
+
+#[test]
+fn test_empty_table() -> TestResult {
+    let path = test_path();
+
+    let table = TableBuilder::create(&path, TableOptions::default())?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.metadata().record_count, 0);
+    assert!(reader.get(b"missing")?.is_none());
+
+    let records: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert!(records.is_empty());
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_keys_allowed() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.duplicate_policy = DuplicatePolicy::Allow;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(b"apple", b"first")?;
+    table.add(b"apple", b"second")?;
+    table.add(b"apple", b"third")?;
+    table.add(b"banana", b"yellow")?;
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.metadata().record_count, 4);
+
+    let records: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].key, b"apple");
+    assert_eq!(records[1].key, b"apple");
+    assert_eq!(records[2].key, b"apple");
+
+    assert_eq!(records[0].value, b"first");
+    assert_eq!(records[1].value, b"second");
+    assert_eq!(records[2].value, b"third");
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_keys_across_blocks() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.duplicate_policy = DuplicatePolicy::Allow;
+    options.block_size = 1;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(b"apple", b"first")?;
+    table.add(b"apple", b"second")?;
+    table.add(b"apple", b"third")?;
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    let records: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(records.len(), 3);
+
+    for record in &records {
+        assert_eq!(record.key, b"apple");
+    }
+
+    assert_eq!(records[0].value, b"first");
+    assert_eq!(records[1].value, b"second");
+    assert_eq!(records[2].value, b"third");
+
+    assert!(reader.get(b"apple")?.is_some());
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_oversized_record() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.block_size = 64;
+
+    let key = vec![b'k'; 128];
+    let value = vec![b'v'; 4096];
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(&key, &value)?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(&key)?.as_deref(), Some(value.as_slice()));
+
+    let stats = reader.stats();
+
+    assert_eq!(stats.blocks_read, 1);
+    assert_eq!(stats.blocks_decompressed, 0);
+    assert_eq!(stats.point_lookups, 1);
+    assert_eq!(stats.point_hits, 1);
+    assert_eq!(stats.point_misses, 0);
+    assert_eq!(stats.checksum_failures, 0);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_record_at_block_size_boundary() -> TestResult {
+    let path = test_path();
+
+    let key = b"key";
+    let value = vec![b'x'; 64];
+
+    let mut options = TableOptions::default();
+    options.block_size = key.len() + value.len() + 6;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(key, &value)?;
+    table.add(b"next", b"value")?;
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(key)?.as_deref(), Some(value.as_slice()));
+    assert_eq!(reader.get(b"next")?.as_deref(), Some(b"value".as_slice()));
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_first_and_last_keys() -> TestResult {
+    let table = TestTable::new()?;
+    let mut reader = table.open()?;
+
+    assert_eq!(reader.get(b"app")?.as_deref(), Some(b"root".as_slice()));
+
+    assert_eq!(reader.get(b"date")?.as_deref(), Some(b"brown".as_slice()));
+
+    assert!(reader.get(b"aaa")?.is_none());
+    assert!(reader.get(b"zebra")?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn test_large_record_count() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.block_size = 4096;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    let count = 10_000usize;
+
+    for i in 0..count {
+        let key = format!("key-{i:08}");
+        let value = format!("value-{i:08}");
+
+        table.add(key.as_bytes(), value.as_bytes())?;
+    }
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.metadata().record_count, count as u64);
+
+    for i in [0, 1, 100, 999, 5000, 9999] {
+        let key = format!("key-{i:08}");
+        let value = format!("value-{i:08}");
+
+        assert_eq!(
+            reader.get(key.as_bytes())?.as_deref(),
+            Some(value.as_bytes())
+        );
+    }
+
+    let records: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(records.len(), count);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_empty_batch() -> TestResult {
+    let path = test_path();
+
+    let mut table = TableBuilder::create(&path, TableOptions::default())?;
+
+    table.add(b"apple", b"red")?;
+    table.add_batch(Vec::<Record<'_>>::new())?;
+    table.add(b"banana", b"yellow")?;
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.metadata().record_count, 2);
+    assert_eq!(reader.get(b"apple")?.as_deref(), Some(b"red".as_slice()));
+    assert_eq!(
+        reader.get(b"banana")?.as_deref(),
+        Some(b"yellow".as_slice())
+    );
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_lexicographic_sort_rejects_duplicates() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.key_order = KeyOrder::Lexicographic;
+    options.duplicate_policy = DuplicatePolicy::Reject;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(b"banana", b"yellow")?;
+    table.add(b"apple", b"red")?;
+    table.add(b"apple", b"green")?;
+
+    let result = table.finalize();
+
+    assert!(matches!(result, Err(StryxError::DuplicateKey)));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn test_lexicographic_sort_allows_duplicates() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.key_order = KeyOrder::Lexicographic;
+    options.duplicate_policy = DuplicatePolicy::Allow;
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(b"banana", b"yellow")?;
+    table.add(b"apple", b"first")?;
+    table.add(b"apple", b"second")?;
+    table.add(b"cherry", b"red")?;
+
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    let records: Vec<OwnedRecord> = reader.iter().collect::<Result<Vec<_>, _>>()?;
+
+    assert_eq!(records.len(), 4);
+
+    for pair in records.windows(2) {
+        assert!(pair[0].key <= pair[1].key);
+    }
+
+    let apple_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.key == b"apple")
+        .collect();
+
+    assert_eq!(apple_records.len(), 2);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_corrupted_data_block_checksum() -> TestResult {
+    let path = test_path();
+
+    let mut options = TableOptions::default();
+    options.compression = Compression::None;
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut bytes = std::fs::read(&path)?;
+
+    // Corrupt a byte in the data section.
+    bytes[0] ^= 0xFF;
+
+    std::fs::write(&path, bytes)?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    let result = reader.get(b"apple");
+
+    assert!(result.is_err());
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_corrupted_index_checksum() -> TestResult {
+    let path = test_path();
+
+    let mut table = TableBuilder::create(&path, TableOptions::default())?;
+
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let reader = TableReader::open(&path)?;
+    let metadata = reader.metadata().clone();
+
+    let mut bytes = std::fs::read(&path)?;
+
+    let checksum_offset = (metadata.index_offset + metadata.index_size - 4) as usize;
+
+    bytes[checksum_offset] ^= 0xFF;
+
+    std::fs::write(&path, bytes)?;
+
+    assert_matches!(TableReader::open(&path), Err(StryxError::InvalidChecksum));
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_invalid_footer_magic() -> TestResult {
+    let path = test_path();
+
+    let mut table = TableBuilder::create(&path, TableOptions::default())?;
+
+    table.add(b"apple", b"red")?;
+    table.finalize()?;
+
+    let mut bytes = std::fs::read(&path)?;
+
+    let footer_offset = bytes.len() - 8;
+
+    bytes[footer_offset..].copy_from_slice(b"INVALID!");
+
+    std::fs::write(&path, bytes)?;
+
+    assert_matches!(TableReader::open(&path), Err(StryxError::InvalidMagic));
+
+    std::fs::remove_file(path)?;
     Ok(())
 }

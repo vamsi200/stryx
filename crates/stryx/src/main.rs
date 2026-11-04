@@ -11,7 +11,7 @@ use rand::{RngExt, rng};
 use spillsort::{Config, Sorter};
 use stryx::{
     builder::{Record, RecordReader, TableBuilder},
-    config::{Compression, TableOptions},
+    config::{Compression, DuplicatePolicy, TableOptions},
     error::DecodeError,
     reader::TableReader,
     tests::random_records,
@@ -26,6 +26,8 @@ fn main() -> anyhow::Result<()> {
     let table_options = TableOptions {
         compression: Compression::Lz4,
         key_order: stryx::config::KeyOrder::Lexicographic,
+        duplicate_policy: DuplicatePolicy::Allow,
+        // block_size: 64,
         ..TableOptions::default()
     };
 
@@ -48,7 +50,9 @@ fn main() -> anyhow::Result<()> {
     println!("starting..");
 
     table.add_batch(records);
-    table.finalize()?;
+    let (_, stats) = table.finalize()?;
+
+    println!("{stats}");
 
     let mut reader = TableReader::open("lz4.stryx")?;
 
@@ -59,7 +63,7 @@ fn main() -> anyhow::Result<()> {
         // println!("{s:?}");
     }
 
-    println!("{:#?}", reader.stats());
+    println!("{}", reader.stats());
 
     // println!(
     //     "{:?}",

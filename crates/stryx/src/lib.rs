@@ -10,3 +10,5 @@ pub const BLOCK_SIZE: usize = 16 * 1024;
 pub const FOOTER_SIZE: usize = 28;
 pub const MAGIC: &[u8; 8] = b"STRYX001";
 pub const VERSION: u32 = 1;
+
+pub const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];

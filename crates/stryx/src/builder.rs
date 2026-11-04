@@ -1,24 +1,17 @@
-#![allow(unused)]
-
-use core::panic;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
-    os::fd::OwnedFd,
     path::Path,
 };
 
 use anyhow::Context;
-use spillsort::Sorter;
-use zstd::zstd_safe::WriteBuf;
 
 use crate::{
-    BLOCK_SIZE, FOOTER_SIZE, MAGIC, VERSION,
+    FOOTER_SIZE, MAGIC, UNITS, VERSION,
     config::{Compression, DuplicatePolicy, KeyOrder, TableOptions},
     decoder::Decoder,
     error::{DecodeError, StryxError},
-    index::{IndexBuilder, IndexEntry},
-    reader::OwnedRecord,
+    index::IndexBuilder,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -33,30 +26,9 @@ impl<'a> Record<'a> {
     }
 }
 
-#[derive(Debug)]
-pub struct DataBlock<'a> {
-    records: &'a [Record<'a>],
-    offsets: &'a [u32],
-    records_count: u32,
-}
-
-#[derive(Debug)]
-struct Footer {
-    pub index_offset: u64,
-    pub index_size: u64,
-    pub version: u16,
-    pub magic_bytes: [u8; 8],
-}
-
 pub trait Encode {
     fn encode_len(&self) -> usize;
     fn encode_record(&self) -> Result<Vec<u8>, DecodeError>;
-}
-
-#[derive(Debug)]
-struct RecordInfo {
-    key_len: u16,
-    value_len: u32,
 }
 
 pub struct RecordReader<'a> {
@@ -80,7 +52,7 @@ impl<'a> RecordReader<'a> {
             return Err(DecodeError::Truncated);
         }
 
-        let key_len = u16::from_le_bytes([remaining[0], self.value[1]]) as usize;
+        let key_len = u16::from_le_bytes([remaining[0], remaining[1]]) as usize;
         let value_len = u32::from_le_bytes(
             remaining[2..6]
                 .try_into()
@@ -124,11 +96,10 @@ impl Encode for Record<'_> {
             .context("Value Too Large")
             .unwrap();
 
-        value.write(&key_len.to_le_bytes());
-        value.write(&value_len.to_le_bytes());
-
-        value.write(&self.key);
-        value.write(&self.value);
+        value.write(&key_len.to_le_bytes())?;
+        value.write(&value_len.to_le_bytes())?;
+        value.write(&self.key)?;
+        value.write(&self.value)?;
 
         Ok(value)
     }
@@ -183,7 +154,7 @@ impl TableBuilder<BufWriter<File>> {
             )?),
         };
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
@@ -258,7 +229,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         // Include the additional u32 offset for the incoming record
         if !self.block.is_empty()
-            && self.block.size() + encoded_record.len() + size_of::<u32>() > BLOCK_SIZE
+            && self.block.size() + encoded_record.len() + size_of::<u32>() > self.options.block_size
         {
             // println!("Exceeds Block Size, inserting into new one..");
             self.flush_block()?;
@@ -343,7 +314,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
     /// Flush remaining blocks, write index and footer, finalize file
     /// and return the metadata about completed table.
-    pub fn finalize(mut self) -> Result<TableMetadata, StryxError> {
+    pub fn finalize(mut self) -> Result<(TableMetadata, WriteStatistics), StryxError> {
         if let Some(sorter) = self.sorter.take() {
             let mut sorted = sorter.finish()?;
 
@@ -354,13 +325,14 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.flush_block()?;
 
+        let statistics = self.statistics();
+
         // Encode sparse index
         let encoded_index = self.index.finish()?;
 
         // index block
         let index_offset = self.offset;
         let index_size = u64::try_from(encoded_index.len())?;
-        let file_size = index_offset + index_size + 28;
 
         let mut table_metadata = TableMetadata {
             record_count: self.record_count,
@@ -389,11 +361,11 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.writer.flush()?;
 
-        Ok(table_metadata)
+        Ok((table_metadata, statistics))
     }
 
     /// Return current write statistics
-    pub fn statistics(&self) -> WriteStatistics {
+    fn statistics(&self) -> WriteStatistics {
         WriteStatistics {
             record_count: self.record_count,
             blocks_written: self.block_count,
@@ -402,11 +374,66 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WriteStatistics {
     pub record_count: u64,
     pub blocks_written: u32,
     pub bytes_written: u64,
+}
+
+impl std::fmt::Display for WriteStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = |n: u64| -> String {
+            if n < 1024 {
+                return format!("{n} B");
+            }
+            let mut val = n as f64;
+            let mut unit = 0;
+            while val >= 1024.0 && unit < UNITS.len() - 1 {
+                val /= 1024.0;
+                unit += 1;
+            }
+            format!("{val:.2} {}", UNITS[unit])
+        };
+
+        let avg_block = if self.blocks_written == 0 {
+            None
+        } else {
+            Some(self.bytes_written / self.blocks_written as u64)
+        };
+
+        let avg_record = if self.record_count == 0 {
+            None
+        } else {
+            Some(self.bytes_written as f64 / self.record_count as f64)
+        };
+
+        writeln!(f, "WriteStatistics {{")?;
+
+        writeln!(f, "  Records:")?;
+        writeln!(f, "    count: {}", self.record_count)?;
+
+        writeln!(f, "  I/O:")?;
+        writeln!(f, "    blocks written: {}", self.blocks_written)?;
+        writeln!(
+            f,
+            "    bytes written:  {} ({})",
+            bytes(self.bytes_written),
+            self.bytes_written
+        )?;
+
+        writeln!(f, "  Averages:")?;
+        match avg_block {
+            Some(b) => writeln!(f, "    bytes/block:  {} ({b})", bytes(b))?,
+            None => writeln!(f, "    bytes/block:  n/a")?,
+        }
+        match avg_record {
+            Some(r) => writeln!(f, "    bytes/record: {r:.2}")?,
+            None => writeln!(f, "    bytes/record: n/a")?,
+        }
+
+        write!(f, "}}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -477,9 +504,9 @@ impl TableMetadata {
         let record_count = decoder.read_u64()?;
         let block_count = decoder.read_u32()?;
         let file_size = decoder.read_u64()?;
-        let min_key_size = decoder.read_u64()? as usize;
+        let min_key_size = usize::try_from(decoder.read_u64()?)?;
         let min_key = decoder.read_bytes(min_key_size)?;
-        let max_key_size = decoder.read_u64()? as usize;
+        let max_key_size = usize::try_from(decoder.read_u64()?)?;
         let max_key = decoder.read_bytes(max_key_size)?;
         let index_offset = decoder.read_u64()?;
         let index_size = decoder.read_u64()?;
@@ -545,9 +572,6 @@ pub struct BlockBuilder {
 
     /// Byte offsets of records within the block
     offsets: Vec<u32>,
-
-    /// Checksum for record
-    checksum: u32,
 }
 
 impl BlockBuilder {
@@ -596,5 +620,158 @@ impl BlockBuilder {
     pub fn clear(&mut self) {
         self.data.clear();
         self.offsets.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+
+        encoded.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        encoded.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(key);
+        encoded.extend_from_slice(value);
+
+        encoded
+    }
+
+    #[test]
+    fn test_record_reader_single_record() {
+        let bytes = encode_record(b"apple", b"red");
+        let mut reader = RecordReader::new(&bytes);
+
+        let record = reader.next_record().unwrap().unwrap();
+
+        assert_eq!(record.key, b"apple");
+        assert_eq!(record.value, b"red");
+        assert_eq!(reader.pos(), bytes.len());
+
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_reader_multiple_records() {
+        let mut bytes = encode_record(b"apple", b"red");
+        bytes.extend(encode_record(b"banana", b"yellow"));
+        bytes.extend(encode_record(b"cherry", b"red"));
+
+        let mut reader = RecordReader::new(&bytes);
+
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.key, b"apple");
+        assert_eq!(first.value, b"red");
+
+        let second = reader.next_record().unwrap().unwrap();
+        assert_eq!(second.key, b"banana");
+        assert_eq!(second.value, b"yellow");
+
+        let third = reader.next_record().unwrap().unwrap();
+        assert_eq!(third.key, b"cherry");
+        assert_eq!(third.value, b"red");
+
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.pos(), bytes.len());
+    }
+
+    #[test]
+    fn test_record_reader_empty_key_and_value() {
+        let bytes = encode_record(b"", b"");
+        let mut reader = RecordReader::new(&bytes);
+
+        let record = reader.next_record().unwrap().unwrap();
+
+        assert!(record.key.is_empty());
+        assert!(record.value.is_empty());
+        assert_eq!(reader.pos(), 6);
+    }
+
+    #[test]
+    fn test_record_reader_empty_key() {
+        let bytes = encode_record(b"", b"value");
+        let mut reader = RecordReader::new(&bytes);
+
+        let record = reader.next_record().unwrap().unwrap();
+
+        assert!(record.key.is_empty());
+        assert_eq!(record.value, b"value");
+    }
+
+    #[test]
+    fn test_record_reader_empty_value() {
+        let bytes = encode_record(b"key", b"");
+        let mut reader = RecordReader::new(&bytes);
+
+        let record = reader.next_record().unwrap().unwrap();
+
+        assert_eq!(record.key, b"key");
+        assert!(record.value.is_empty());
+    }
+
+    #[test]
+    fn test_record_reader_truncated_header() {
+        for len in 1..6 {
+            let bytes = vec![0u8; len];
+            let mut reader = RecordReader::new(&bytes);
+
+            assert!(matches!(reader.next_record(), Err(DecodeError::Truncated)));
+        }
+    }
+
+    #[test]
+    fn test_record_reader_truncated_key() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"app");
+
+        let mut reader = RecordReader::new(&bytes);
+
+        assert!(matches!(reader.next_record(), Err(DecodeError::Truncated)));
+    }
+
+    #[test]
+    fn test_record_reader_truncated_value() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(b"key");
+        bytes.extend_from_slice(b"ab");
+
+        let mut reader = RecordReader::new(&bytes);
+
+        assert!(matches!(reader.next_record(), Err(DecodeError::Truncated)));
+    }
+
+    #[test]
+    fn test_record_reader_max_key_length() {
+        let key = vec![b'k'; u16::MAX as usize];
+        let bytes = encode_record(&key, b"value");
+
+        let mut reader = RecordReader::new(&bytes);
+        let record = reader.next_record().unwrap().unwrap();
+
+        assert_eq!(record.key, key);
+        assert_eq!(record.value, b"value");
+    }
+
+    #[test]
+    fn test_record_reader_position_after_error() {
+        let mut bytes = encode_record(b"apple", b"red");
+
+        bytes.extend_from_slice(&[0x01, 0x02]);
+
+        let mut reader = RecordReader::new(&bytes);
+
+        assert!(reader.next_record().unwrap().is_some());
+
+        let previous_pos = reader.pos();
+
+        assert!(reader.next_record().is_err());
+        assert_eq!(reader.pos(), previous_pos);
     }
 }

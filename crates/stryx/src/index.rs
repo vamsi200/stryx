@@ -98,3 +98,131 @@ impl IndexEntry {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_entry() -> Result<(), StryxError> {
+        let entry = IndexEntry {
+            first_key: b"apple".to_vec(),
+            offset: 1024,
+            size: 4096,
+        };
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded)?;
+
+        let mut decoder = Decoder::new(&encoded);
+        let decoded = IndexEntry::decode(&mut decoder)?;
+
+        assert_eq!(decoded.first_key, entry.first_key);
+        assert_eq!(decoded.offset, entry.offset);
+        assert_eq!(decoded.size, entry.size);
+        assert_eq!(decoder.remaining(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_entry_empty_key() -> Result<(), StryxError> {
+        let entry = IndexEntry {
+            first_key: vec![],
+            offset: 0,
+            size: 0,
+        };
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded)?;
+
+        let mut decoder = Decoder::new(&encoded);
+        let decoded = IndexEntry::decode(&mut decoder)?;
+
+        assert!(decoded.first_key.is_empty());
+        assert_eq!(decoded.offset, 0);
+        assert_eq!(decoded.size, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_entry_max_key_length() -> Result<(), StryxError> {
+        let entry = IndexEntry {
+            first_key: vec![b'v'; u16::MAX as usize],
+            offset: u64::MAX,
+            size: u32::MAX,
+        };
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded)?;
+
+        let mut decoder = Decoder::new(&encoded);
+        let decoded = IndexEntry::decode(&mut decoder)?;
+
+        assert_eq!(decoded.first_key, entry.first_key);
+        assert_eq!(decoded.offset, u64::MAX);
+        assert_eq!(decoded.size, u32::MAX);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_entry_key_too_large() {
+        let entry = IndexEntry {
+            first_key: vec![b'a'; u16::MAX as usize + 1],
+            offset: 0,
+            size: 0,
+        };
+
+        let mut encoded = Vec::new();
+
+        assert!(entry.encode(&mut encoded).is_err());
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn test_index_entry_truncated_key_length() {
+        let bytes = [0x01];
+        let mut decoder = Decoder::new(&bytes);
+
+        assert!(IndexEntry::decode(&mut decoder).is_err());
+    }
+
+    #[test]
+    fn test_index_entry_truncated_key() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(b"msi");
+
+        let mut decoder = Decoder::new(&bytes);
+
+        assert!(IndexEntry::decode(&mut decoder).is_err());
+    }
+
+    #[test]
+    fn test_index_entry_truncated_offset() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 7]);
+
+        let mut decoder = Decoder::new(&bytes);
+
+        assert!(IndexEntry::decode(&mut decoder).is_err());
+    }
+
+    #[test]
+    fn test_index_entry_truncated_size() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 3]);
+
+        let mut decoder = Decoder::new(&bytes);
+
+        assert!(IndexEntry::decode(&mut decoder).is_err());
+    }
+}

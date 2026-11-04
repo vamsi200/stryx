@@ -8,6 +8,8 @@ pub enum DecodeError {
     InvalidLength,
     #[error("{0}")]
     SliceConversion(#[from] TryFromSliceError),
+    #[error("{0}")]
+    StdIo(#[from] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

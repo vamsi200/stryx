@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    FOOTER_SIZE, MAGIC, VERSION,
-    builder::{DataBlock, Record, RecordReader, TableMetadata},
+    FOOTER_SIZE, MAGIC, UNITS, VERSION,
+    builder::{Record, RecordReader, TableMetadata},
     config::Compression,
     decoder::Decoder,
     error::{DecodeError, StryxError},
@@ -51,9 +51,19 @@ impl<'a> BlockReader<'a> {
 
         while let Some(record) = record_reader.next_record()? {
             records.push(record);
-            if records.len() >= temp {
+            if records.len() == temp {
                 break;
             }
+        }
+
+        if records.len() != temp {
+            return Err(DecodeError::InvalidLength.into());
+        }
+
+        // Ensure record reader consumed exactly the record region.
+        // No trailing or unaccounted bytes are allowed before the offsets section.
+        if record_reader.pos() != buf_len - 8 - (temp * size_of::<u32>()) {
+            return Err(DecodeError::InvalidLength.into());
         }
 
         let mut offsets = vec![];
@@ -318,7 +328,6 @@ impl TableReader {
 }
 
 /// Decompress a data block.
-///
 /// Returns the decoded bytes and whether decompression was performed.
 fn decompress_block(
     compression: Compression,
@@ -375,6 +384,80 @@ pub struct ReadStats {
 
     /// Number of full-table iteration queries.
     pub iter_queries: u64,
+}
+
+impl std::fmt::Display for ReadStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = |n: u64| -> String {
+            if n < 1024 {
+                return format!("{n} B");
+            }
+            let mut val = n as f64;
+            let mut unit = 0;
+            while val >= 1024.0 && unit < UNITS.len() - 1 {
+                val /= 1024.0;
+                unit += 1;
+            }
+            format!("{val:.2} {}", UNITS[unit])
+        };
+
+        let total_point = self.point_hits + self.point_misses;
+        let hit_rate = if total_point == 0 {
+            None
+        } else {
+            Some(100.0 * self.point_hits as f64 / total_point as f64)
+        };
+
+        let ratio = if self.bytes_read == 0 {
+            None
+        } else {
+            Some(self.bytes_decompressed as f64 / self.bytes_read as f64)
+        };
+
+        writeln!(f, "ReadStats {{")?;
+
+        writeln!(f, "  I/O:")?;
+        writeln!(f, "    blocks read:        {}", self.blocks_read)?;
+        writeln!(
+            f,
+            "    bytes read:         {} ({})",
+            bytes(self.bytes_read),
+            self.bytes_read
+        )?;
+
+        writeln!(f, "  Decompression:")?;
+        writeln!(f, "    blocks decompressed: {}", self.blocks_decompressed)?;
+        writeln!(
+            f,
+            "    bytes decompressed:  {} ({})",
+            bytes(self.bytes_decompressed),
+            self.bytes_decompressed
+        )?;
+
+        match ratio {
+            Some(r) => writeln!(f, "    compression ratio:   {r:.2}x")?,
+            None => writeln!(f, "    compression ratio:   n/a")?,
+        }
+
+        writeln!(f, "  Point lookups:")?;
+        writeln!(f, "    total:  {}", self.point_lookups)?;
+        writeln!(f, "    hits:   {}", self.point_hits)?;
+        writeln!(f, "    misses: {}", self.point_misses)?;
+
+        match hit_rate {
+            Some(r) => writeln!(f, "    hit rate: {r:.1}%")?,
+            None => writeln!(f, "    hit rate: n/a")?,
+        }
+
+        writeln!(f, "  Queries:")?;
+        writeln!(f, "    prefix: {}", self.prefix_queries)?;
+        writeln!(f, "    range:  {}", self.range_queries)?;
+        writeln!(f, "    iter:   {}", self.iter_queries)?;
+
+        writeln!(f, "  Checksum failures: {}", self.checksum_failures)?;
+
+        write!(f, "}}")
+    }
 }
 
 #[derive(Debug)]
@@ -539,5 +622,104 @@ impl Iterator for TableIterator<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+
+    fn make_block(records: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut block = Vec::new();
+        let mut offsets = Vec::new();
+
+        for (key, value) in records {
+            offsets.push(block.len() as u32);
+
+            block.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            block.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            block.extend_from_slice(key);
+            block.extend_from_slice(value);
+        }
+
+        for offset in offsets {
+            block.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        block.extend_from_slice(&(records.len() as u32).to_le_bytes());
+
+        let checksum = crc32c::crc32c(&block);
+        block.extend_from_slice(&checksum.to_le_bytes());
+
+        block
+    }
+
+    #[test]
+    fn test_block_reader_single_record() -> Result<()> {
+        let block = make_block(&[(b"apple", b"red")]);
+
+        let reader = BlockReader::new(&block)?;
+
+        assert_eq!(reader.record_count, 1);
+        assert_eq!(reader.records.len(), 1);
+        assert_eq!(reader.offsets.len(), 1);
+
+        assert_eq!(reader.records[0].key, b"apple");
+        assert_eq!(reader.records[0].value, b"red");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_reader_multiple_records() -> Result<()> {
+        let block = make_block(&[
+            (b"apple", b"red"),
+            (b"banana", b"yellow"),
+            (b"cherry", b"red"),
+        ]);
+
+        let reader = BlockReader::new(&block)?;
+
+        assert_eq!(reader.record_count, 3);
+        assert_eq!(reader.records.len(), 3);
+        assert_eq!(reader.offsets.len(), 3);
+
+        assert_eq!(reader.records[0].key, b"apple");
+        assert_eq!(reader.records[1].key, b"banana");
+        assert_eq!(reader.records[2].key, b"cherry");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_block_reader_empty_block() {
+        let block = make_block(&[]);
+
+        assert!(BlockReader::new(&block).is_err());
+    }
+
+    #[test]
+    fn test_block_reader_truncated_block() {
+        for len in 0..8 {
+            let block = vec![0u8; len];
+
+            assert!(
+                BlockReader::new(&block).is_err(),
+                "unexpectedly accepted block of length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_reader_too_many_records() {
+        let mut block = make_block(&[(b"apple", b"red")]);
+
+        let count_offset = block.len() - 8;
+
+        block[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        assert!(BlockReader::new(&block).is_err());
     }
 }
