@@ -11,7 +11,7 @@ use rand::{RngExt, rng};
 use spillsort::{Config, Sorter};
 use stryx::{
     builder::{Record, RecordReader, TableBuilder},
-    config::{Compression, DuplicatePolicy, TableOptions},
+    config::{Compression, DuplicatePolicy, FilterType, TableOptions},
     error::DecodeError,
     reader::TableReader,
     tests::random_records,
@@ -24,9 +24,10 @@ fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let table_options = TableOptions {
-        compression: Compression::Lz4,
+        compression: Compression::Zstd,
         key_order: stryx::config::KeyOrder::Lexicographic,
         duplicate_policy: DuplicatePolicy::Allow,
+        filter_type: FilterType::BinaryFuse16,
         // block_size: 64,
         ..TableOptions::default()
     };
@@ -39,7 +40,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut table = TableBuilder::new(file, table_options)?;
 
-    let (keys, values) = random_records(1_000_000, true);
+    let (keys, values) = random_records(1_000, true);
 
     let records: Vec<Record<'_>> = keys
         .iter()
@@ -49,21 +50,30 @@ fn main() -> anyhow::Result<()> {
 
     println!("starting..");
 
+    let key = records[999].key;
+
     table.add_batch(records);
     let (_, stats) = table.finalize()?;
 
-    println!("{stats}");
-
     let mut reader = TableReader::open("lz4.stryx")?;
+
+    // let key = [
+    //     92, 30, 23, 10, 23, 34, 42, 24, 5, 52, 34, 29, 32, 13, 43, 5, 4,
+    // ];
+
+    let iterations = 10_000;
 
     let start = Instant::now();
 
-    for s in reader.prefix(&[1u8])? {
-        // let s = s?;
-        // println!("{s:?}");
+    for _ in 0..iterations {
+        let result = reader.get(std::hint::black_box(key))?;
+        std::hint::black_box(result);
     }
 
-    println!("{}", reader.stats());
+    let elapsed = start.elapsed();
+
+    println!("Total: {:?}", elapsed);
+    println!("Average: {:?}", elapsed / iterations);
 
     // println!(
     //     "{:?}",
@@ -72,12 +82,6 @@ fn main() -> anyhow::Result<()> {
     // for key in &keys {
     //     black_box(reader.get(black_box(key))?);
     // }
-
-    // let elapsed = start.elapsed();
-
-    // println!("Lookups: {}", keys.len());
-    // println!("Total: {:?}", elapsed);
-    // println!("Average: {:?}", elapsed / keys.len() as u32);
 
     //
     // write_to_file(&mut file, &output)?;

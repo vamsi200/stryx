@@ -7,12 +7,18 @@ use std::{
     u8, vec,
 };
 
+use xorf::Filter;
+
 use crate::{
-    FOOTER_SIZE, MAGIC, UNITS, VERSION,
-    builder::{Record, RecordReader, TableMetadata},
-    config::Compression,
+    FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
+    builder::{
+        FilterTypeRepr, Record, RecordReader, TableBuilder, TableMetadata, XorFilter,
+        from_filter_type,
+    },
+    config::{Compression, FilterType},
     decoder::Decoder,
     error::{DecodeError, StryxError},
+    helper::filter_decode,
     index::IndexEntry,
 };
 
@@ -98,6 +104,7 @@ pub struct TableReader {
     index: Vec<IndexEntry>,
     metadata: TableMetadata,
     readstats: ReadStats,
+    filter: XorFilter,
 }
 
 impl TableReader {
@@ -109,7 +116,7 @@ impl TableReader {
         file.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         file.read_exact(&mut footer)?;
 
-        if &footer[20..28] != MAGIC {
+        if &footer[21..29] != MAGIC {
             return Err(StryxError::InvalidMagic);
         }
 
@@ -117,25 +124,54 @@ impl TableReader {
 
         let index_offset = decoder.read_u64()?;
         let index_size = decoder.read_u64()?;
+        let filter_type = from_filter_type(decoder.read_u8()?);
         let version = decoder.read_u32()?;
 
         // metadata starts right afer encoded_index, so offset is just:
         let metadata_offset = index_offset + index_size;
-        let file_size = file.metadata()?.len();
-
-        // (total file size - FOOTER_SIZE) gives end of metadata's position
-        // metadata size = Total File Size - FOOTER_SIZE - metadata_offset
-        let metadata_size = file_size
-            .checked_sub(metadata_offset + FOOTER_SIZE as u64)
-            .ok_or(StryxError::InvalidRange)?;
-
         file.seek(std::io::SeekFrom::Start(metadata_offset))?;
 
-        let metadata_len = usize::try_from(metadata_size)?;
-        let mut metadata_buf = vec![0u8; metadata_len];
-        file.read_exact(&mut metadata_buf)?;
+        let mut len_buf = [0u8; 8];
+        file.read_exact(&mut len_buf)?;
+        let metadata_size = u64::from_le_bytes(len_buf);
 
+        let mut metadata_buf = vec![0u8; usize::try_from(metadata_size)?];
+        file.read_exact(&mut metadata_buf)?;
         let metadata = TableMetadata::decode(&metadata_buf)?;
+
+        let mut filter = XorFilter::None;
+
+        if let Some(ft) = filter_type {
+            let filter_section_offset = metadata_offset + 8 + metadata_size;
+            let remaining = file
+                .metadata()?
+                .len()
+                .checked_sub(filter_section_offset + 8 + 4 + FOOTER_SIZE as u64)
+                .ok_or(DecodeError::InvalidLength)?;
+
+            file.seek(std::io::SeekFrom::Start(filter_section_offset))?;
+
+            let mut len_buf = [0u8; 8];
+            file.read_exact(&mut len_buf)?;
+            let filter_len = usize::try_from(u64::from_le_bytes(len_buf))?;
+
+            if filter_len != usize::try_from(remaining)? {
+                return Err(StryxError::InvalidRange);
+            }
+
+            let mut filter_data = vec![0u8; filter_len];
+            file.read_exact(&mut filter_data)?;
+
+            let mut crc_buf = [0u8; 4];
+            file.read_exact(&mut crc_buf)?;
+            let stored = u32::from_le_bytes(crc_buf);
+
+            if stored != crc32c::crc32c(&filter_data) {
+                return Err(StryxError::InvalidFilterChecksum);
+            }
+
+            filter = filter_decode(&filter_data, ft)?;
+        }
 
         if version != VERSION {
             return Err(StryxError::InvalidVersion);
@@ -183,15 +219,30 @@ impl TableReader {
             index: index_entries,
             metadata,
             readstats: ReadStats::default(),
+            filter,
         })
+    }
+
+    fn xorf_contains(&self, key: &[u8]) -> bool {
+        let key_hash = xxhash_rust::xxh3::xxh3_64_with_seed(key, KEY_HASH_SEED);
+
+        match &self.filter {
+            XorFilter::BinaryFuse8(bf) => bf.contains(&key_hash),
+            XorFilter::BinaryFuse16(bf) => bf.contains(&key_hash),
+            _ => true,
+        }
     }
 
     /// Find the value associated with a key.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
+        if !self.xorf_contains(key) {
+            return Ok(None);
+        }
+
         self.readstats.point_lookups += 1;
 
         // find the first index entry whose first_key is greater than requested
-        // key, the preceeding block could have key
+        // key.
         let block = self
             .index
             .partition_point(|entry| entry.first_key.as_slice() <= key);

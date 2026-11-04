@@ -21,11 +21,19 @@ pub struct TableOptions {
     /// Duplicate key handling
     pub duplicate_policy: DuplicatePolicy,
 
-    /// Bloom filter bits allocated per key
-    pub bloom_filter_bits_per_key: Option<usize>,
+    /// Filter type
+    pub filter_type: FilterType,
 
     /// Number of records between prefix-compression restart points
     pub restart_interval: usize,
+}
+
+#[derive(Debug, Default)]
+pub enum FilterType {
+    #[default]
+    None,
+    BinaryFuse8,
+    BinaryFuse16,
 }
 
 #[repr(u8)]
@@ -70,7 +78,7 @@ impl Default for TableOptions {
     fn default() -> Self {
         Self {
             block_size: BLOCK_SIZE,
-            bloom_filter_bits_per_key: None,
+            filter_type: FilterType::None,
             compression: Compression::default(),
             checksum: Checksum::default(),
             index_type: IndexType::default(),

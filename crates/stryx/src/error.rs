@@ -4,12 +4,18 @@ use std::{array::TryFromSliceError, num::TryFromIntError};
 pub enum DecodeError {
     #[error("Record truncated")]
     Truncated,
+
     #[error("Invalid record len")]
     InvalidLength,
+
     #[error("{0}")]
     SliceConversion(#[from] TryFromSliceError),
+
     #[error("{0}")]
     StdIo(#[from] std::io::Error),
+
+    #[error("Failed to create Fuse Filter")]
+    FilterFailed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,4 +60,7 @@ pub enum StryxError {
 
     #[error("{0}")]
     SplillSortError(#[from] spillsort::Error),
+
+    #[error("Invalid filter checksum")]
+    InvalidFilterChecksum,
 }

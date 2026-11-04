@@ -2,15 +2,18 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::Path,
+    vec,
 };
 
 use anyhow::Context;
+use xorf::{BinaryFuse8, BinaryFuse16};
 
 use crate::{
-    FOOTER_SIZE, MAGIC, UNITS, VERSION,
-    config::{Compression, DuplicatePolicy, KeyOrder, TableOptions},
+    FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
+    config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions},
     decoder::Decoder,
     error::{DecodeError, StryxError},
+    helper::filter_encode,
     index::IndexBuilder,
 };
 
@@ -105,6 +108,52 @@ impl Encode for Record<'_> {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug)]
+pub enum FilterTypeRepr {
+    None = 0,
+    BinaryFuse8 = 1,
+    BinaryFuse16 = 2,
+}
+
+pub fn from_filter_type(val: u8) -> Option<FilterTypeRepr> {
+    match val {
+        1 => Some(FilterTypeRepr::BinaryFuse8),
+        2 => Some(FilterTypeRepr::BinaryFuse16),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub enum XorFilter {
+    None,
+    BinaryFuse8(BinaryFuse8),
+    BinaryFuse16(BinaryFuse16),
+}
+
+pub(crate) struct FilterData8 {
+    pub seed: u64,
+    pub segment_length: u32,
+    pub segment_length_mask: u32,
+    pub segment_count_length: u32,
+    pub fingerprint_length: u32,
+    pub fingerprints: Box<[u8]>,
+}
+
+pub(crate) struct FilterData16 {
+    pub seed: u64,
+    pub segment_length: u32,
+    pub segment_length_mask: u32,
+    pub segment_count_length: u32,
+    pub fingerprint_length: u32,
+    pub fingerprints: Box<[u16]>,
+}
+
+pub(crate) struct FilterSection {
+    pub data: Vec<u8>,
+    pub checksum: u32,
+}
+
 #[derive(Debug)]
 pub struct TableBuilder<W: Write> {
     /// Destination for the encoded SSTable
@@ -142,6 +191,9 @@ pub struct TableBuilder<W: Write> {
 
     /// Total record count
     record_count: u64,
+
+    /// Filter Hashes
+    filter_hashes: Vec<u64>,
 }
 
 impl TableBuilder<BufWriter<File>> {
@@ -174,6 +226,7 @@ impl TableBuilder<BufWriter<File>> {
             max_key: None,
             block_count: 0,
             record_count: 0,
+            filter_hashes: vec![],
         })
     }
 }
@@ -201,6 +254,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             max_key: None,
             block_count: 0,
             record_count: 0,
+            filter_hashes: vec![],
         })
     }
 
@@ -215,6 +269,8 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
                 return Err(StryxError::DuplicateKey);
             }
         }
+
+        self.filter_hashes.push(Self::hash_key(key));
 
         let record = Record { key, value };
         self.record_count += 1;
@@ -250,6 +306,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
     /// Append a record
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
         if let Some(sorter) = &mut self.sorter {
+            self.filter_hashes.push(Self::hash_key(key));
             sorter.push(key, value)?;
             return Ok(());
         }
@@ -325,6 +382,29 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.flush_block()?;
 
+        self.filter_hashes.sort_unstable();
+        self.filter_hashes.dedup();
+
+        let filter = match self.options.filter_type {
+            FilterType::None => XorFilter::None,
+            FilterType::BinaryFuse8 => XorFilter::BinaryFuse8(
+                BinaryFuse8::try_from(&self.filter_hashes)
+                    .map_err(|_| DecodeError::FilterFailed)?,
+            ),
+            FilterType::BinaryFuse16 => XorFilter::BinaryFuse16(
+                BinaryFuse16::try_from(&self.filter_hashes)
+                    .map_err(|_| DecodeError::FilterFailed)?,
+            ),
+        };
+
+        let filter_type_repr = match filter {
+            XorFilter::None => FilterTypeRepr::None,
+            XorFilter::BinaryFuse8(_) => FilterTypeRepr::BinaryFuse8,
+            XorFilter::BinaryFuse16(_) => FilterTypeRepr::BinaryFuse16,
+        };
+
+        let filter_section = filter_encode(filter)?;
+
         let statistics = self.statistics();
 
         // Encode sparse index
@@ -346,16 +426,30 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         };
 
         table_metadata.file_size = index_offset
-        + index_size + u64::try_from(table_metadata.len())?
-        + 8 // trailing metadata length
-        + FOOTER_SIZE as u64;
+            + index_size
+            + u64::try_from(table_metadata.len())?
+            + 8 // trailing metadata length
+            + FOOTER_SIZE as u64;
 
+        let metadata_bytes = table_metadata.encode()?;
         self.writer.write_all(&encoded_index)?;
-        self.writer.write_all(&table_metadata.encode()?)?;
+        self.writer
+            .write_all(&(metadata_bytes.len() as u64).to_le_bytes())?;
+        self.writer.write_all(&metadata_bytes)?;
+
+        if let Some(filter_section) = filter_section {
+            self.writer
+                .write_all(&(filter_section.data.len() as u64).to_le_bytes())?;
+            self.writer.write_all(&filter_section.data)?;
+            self.writer
+                .write_all(&filter_section.checksum.to_le_bytes())?;
+        }
 
         // footer
         self.writer.write_all(&index_offset.to_le_bytes())?;
         self.writer.write_all(&index_size.to_le_bytes())?;
+        self.writer
+            .write_all(&(filter_type_repr as u8).to_le_bytes())?;
         self.writer.write_all(&VERSION.to_le_bytes())?; // version btw
         self.writer.write_all(MAGIC)?; // magic bytes
 
@@ -371,6 +465,10 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             blocks_written: self.block_count,
             bytes_written: self.offset,
         }
+    }
+
+    fn hash_key(key: &[u8]) -> u64 {
+        xxhash_rust::xxh3::xxh3_64_with_seed(key, KEY_HASH_SEED)
     }
 }
 
