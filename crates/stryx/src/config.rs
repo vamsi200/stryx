@@ -1,6 +1,5 @@
 //TableConfig or Options whichever
-
-use crate::{BLOCK_SIZE, error::StryxError};
+use crate::BLOCK_SIZE;
 
 #[derive(Debug)]
 pub struct TableOptions {
@@ -40,7 +39,6 @@ pub enum Compression {
 
 #[derive(Default, Debug)]
 pub enum Checksum {
-    None,
     #[default]
     Crc32c,
 }
@@ -80,12 +78,5 @@ impl Default for TableOptions {
             duplicate_policy: DuplicatePolicy::default(),
             restart_interval: 0,
         }
-    }
-}
-
-impl TableOptions {
-    /// Validate configuration before constructing an SSTable
-    pub fn validate(&self) -> Result<(), StryxError> {
-        todo!()
     }
 }

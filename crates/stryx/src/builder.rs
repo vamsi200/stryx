@@ -240,7 +240,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
                 return Err(StryxError::InvalidKeyOrder);
             }
 
-            if key == last_key {
+            if key == last_key && self.options.duplicate_policy == DuplicatePolicy::Reject {
                 return Err(StryxError::DuplicateKey);
             }
         }
