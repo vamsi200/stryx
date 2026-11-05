@@ -48,7 +48,7 @@ pub(crate) fn filter_encode(filter: XorFilter) -> Result<Option<FilterSection>, 
             bf.descriptor.segment_count_length,
             &bf.fingerprints,
             1,
-            |encoded| encoded.extend_from_slice(&*bf.fingerprints),
+            |encoded| encoded.extend_from_slice(&bf.fingerprints),
         ),
         XorFilter::BinaryFuse16(bf) => encode_fuse_data(
             bf.descriptor.seed,

@@ -23,12 +23,6 @@ pub struct Record<'a> {
     pub value: &'a [u8],
 }
 
-impl<'a> Record<'a> {
-    pub fn len(&self) -> usize {
-        self.key.len() + self.value.len()
-    }
-}
-
 pub trait Encode {
     fn encode_len(&self) -> usize;
     fn encode_record(&self) -> Result<Vec<u8>, DecodeError>;
@@ -99,10 +93,10 @@ impl Encode for Record<'_> {
             .context("Value Too Large")
             .unwrap();
 
-        value.write(&key_len.to_le_bytes())?;
-        value.write(&value_len.to_le_bytes())?;
-        value.write(&self.key)?;
-        value.write(&self.value)?;
+        value.write_all(&key_len.to_le_bytes())?;
+        value.write_all(&value_len.to_le_bytes())?;
+        value.write_all(self.key)?;
+        value.write_all(self.value)?;
 
         Ok(value)
     }
@@ -268,10 +262,10 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         }
 
         // hash only when filter_type is some
-        if self.options.filter_type != FilterType::None {
-            if let Some(hashes) = &mut self.filter_hashes {
-                hashes.push(Self::hash_key(key));
-            }
+        if self.options.filter_type != FilterType::None
+            && let Some(hashes) = &mut self.filter_hashes
+        {
+            hashes.push(Self::hash_key(key));
         }
 
         let record = Record { key, value };
@@ -310,10 +304,10 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             sorter.push(key, value)?;
 
             // hash only when filter_type is some
-            if self.options.filter_type != FilterType::None {
-                if let Some(hashes) = &mut self.filter_hashes {
-                    hashes.push(Self::hash_key(key));
-                }
+            if self.options.filter_type != FilterType::None
+                && let Some(hashes) = &mut self.filter_hashes
+            {
+                hashes.push(Self::hash_key(key));
             }
 
             return Ok(());
@@ -384,7 +378,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             let mut sorted = sorter.finish()?;
 
             while let Some((key, value)) = sorted.next_record()? {
-                self.write_record(&key, &value)?;
+                self.write_record(key, value)?;
             }
         }
 
@@ -726,7 +720,7 @@ impl BlockBuilder {
         let checksum = crc32c::crc32c(&self.data);
         self.data.extend_from_slice(&checksum.to_le_bytes());
 
-        Ok(self.data.clone())
+        Ok(std::mem::take(&mut self.data))
     }
 
     /// Reset the block while retaining allocated capacity

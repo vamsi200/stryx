@@ -17,11 +17,6 @@ use stryx::{
     tests::random_records,
 };
 
-fn write_to_file(file: &mut File, value: &[u8]) -> anyhow::Result<()> {
-    file.write_all(&value)?;
-    Ok(())
-}
-
 fn main() -> anyhow::Result<()> {
     let table_options = TableOptions {
         compression: Compression::Zstd,

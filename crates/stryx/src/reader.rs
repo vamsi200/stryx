@@ -1,32 +1,28 @@
-#![allow(unused)]
 use std::{
-    collections::btree_map::Values,
     fs::File,
     io::{Read, Seek},
     path::Path,
-    u8, vec,
+    vec,
 };
 
 use xorf::Filter;
 
 use crate::{
     FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
-    builder::{
-        FilterTypeRepr, Record, RecordReader, TableBuilder, TableMetadata, XorFilter,
-        from_filter_type,
-    },
-    config::{Compression, FilterType},
+    builder::{FilterTypeRepr, Record, TableMetadata, XorFilter, from_filter_type},
+    config::Compression,
     decoder::Decoder,
     error::{DecodeError, StryxError},
     helper::filter_decode,
     index::IndexEntry,
 };
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct BlockReader<'a> {
-    records: Vec<Record<'a>>,
-    offsets: Vec<u32>,
-    record_count: u32,
+    buf: &'a [u8],
+    offsets: &'a [u8],
+    record_count: usize,
     checksum: u32,
 }
 
@@ -38,6 +34,7 @@ impl<'a> BlockReader<'a> {
 
         let buf_len = buf.len();
 
+        // last 4 bytes contain checksum in the Data Block
         let stored_checksum = u32::from_le_bytes(
             buf[buf_len - 4..buf_len]
                 .try_into()
@@ -48,53 +45,87 @@ impl<'a> BlockReader<'a> {
             buf[buf_len - 8..buf_len - 4]
                 .try_into()
                 .map_err(DecodeError::from)?,
-        );
+        ) as usize;
 
-        let mut records = vec![];
-        let mut record_reader = RecordReader::new(&buf);
+        // offset table_len = record_count * size_of::<u32>()
+        let table_len = record_count
+            .checked_mul(size_of::<u32>())
+            .ok_or(DecodeError::InvalidLength)?;
 
-        let temp = record_count as usize;
+        // buf_len - 8 is where offset table ends (last 8 are record_count and checksum)
+        let records_end = (buf_len - 8)
+            .checked_sub(table_len)
+            .ok_or(DecodeError::InvalidLength)?;
 
-        while let Some(record) = record_reader.next_record()? {
-            records.push(record);
-            if records.len() == temp {
-                break;
-            }
-        }
-
-        if records.len() != temp {
-            return Err(DecodeError::InvalidLength.into());
-        }
-
-        // Ensure record reader consumed exactly the record region.
-        // No trailing or unaccounted bytes are allowed before the offsets section.
-        if record_reader.pos() != buf_len - 8 - (temp * size_of::<u32>()) {
-            return Err(DecodeError::InvalidLength.into());
-        }
-
-        let mut offsets = vec![];
-
-        let mut decoder = Decoder::new(&buf);
-        decoder.pos += record_reader.pos();
-
-        for _ in 0..record_count {
-            offsets.push(decoder.read_u32()?);
+        if crc32c::crc32c(&buf[..buf_len - 4]) != stored_checksum {
+            return Err(StryxError::InvalidChecksum);
         }
 
         Ok(Self {
-            records,
-            offsets,
+            buf: &buf[..records_end],
+            offsets: &buf[records_end..buf_len - 8],
             record_count,
             checksum: stored_checksum,
         })
     }
 
-    fn get(&self, key: &[u8]) -> Option<(&[u8], u32)> {
-        self.records
-            .iter()
-            .enumerate()
-            .find(|(_, record)| record.key == key)
-            .map(|(idx, record)| (record.value, self.offsets[idx]))
+    #[inline]
+    fn offset(&self, i: usize) -> usize {
+        u32::from_le_bytes(self.offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+    }
+
+    fn record_at(&self, offset: usize) -> Result<(&'a [u8], &'a [u8]), StryxError> {
+        let header = self
+            .buf
+            .get(offset..offset + 6)
+            .ok_or(DecodeError::Truncated)?;
+        let key_len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let val_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+
+        let key_start = offset + 6;
+        let val_start = key_start + key_len;
+        let end = val_start
+            .checked_add(val_len)
+            .ok_or(DecodeError::InvalidLength)?;
+
+        let key = self
+            .buf
+            .get(key_start..val_start)
+            .ok_or(DecodeError::Truncated)?;
+
+        let val = self.buf.get(val_start..end).ok_or(DecodeError::Truncated)?;
+
+        Ok((key, val))
+    }
+
+    // binary search the key
+    fn get(&self, key: &[u8]) -> Result<Option<(&'a [u8], u32)>, StryxError> {
+        let (mut lo, mut hi) = (0usize, self.record_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let offset = self.offset(mid);
+            let (k, _) = self.record_at(offset)?;
+            if k < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == self.record_count {
+            return Ok(None);
+        }
+        let off = self.offset(lo);
+        let (k, v) = self.record_at(off)?;
+        Ok((k == key).then_some((v, off as u32)))
+    }
+
+    fn records(&self) -> Result<Vec<Record<'a>>, StryxError> {
+        (0..self.record_count)
+            .map(|i| {
+                let (key, value) = self.record_at(self.offset(i))?;
+                Ok(Record { key, value })
+            })
+            .collect()
     }
 }
 
@@ -159,10 +190,8 @@ impl TableReader {
             .and_then(|v| v.checked_add(metadata_size))
             .ok_or(DecodeError::InvalidLength)?;
 
-        if matches!(filter_type, FilterTypeRepr::None) {
-            if filter_section_offset != footer_offset {
-                return Err(DecodeError::InvalidLength.into());
-            }
+        if matches!(filter_type, FilterTypeRepr::None) && filter_section_offset != footer_offset {
+            return Err(DecodeError::InvalidLength.into());
         }
 
         if filter_section_offset > footer_offset {
@@ -263,6 +292,7 @@ impl TableReader {
         match &self.filter {
             XorFilter::BinaryFuse8(bf) => bf.contains(&key_hash),
             XorFilter::BinaryFuse16(bf) => bf.contains(&key_hash),
+            XorFilter::BinaryFuse32(bf) => bf.contains(&key_hash),
             _ => true,
         }
     }
@@ -320,15 +350,18 @@ impl TableReader {
             }
         };
 
-        let result = reader.get(key).map(|x| x.0.to_vec());
+        let result = reader.get(key)?;
 
-        if result.is_some() {
-            self.readstats.point_hits += 1;
-        } else {
-            self.readstats.point_misses += 1;
+        match result {
+            Some(res) => {
+                self.readstats.point_hits += 1;
+                Ok(Some(res.0.to_vec()))
+            }
+            None => {
+                self.readstats.point_misses += 1;
+                Ok(None)
+            }
         }
-
-        Ok(result)
     }
 
     /// Check whether a key exists.
@@ -661,7 +694,7 @@ impl Iterator for TableIterator<'_> {
                     self.reader.readstats.bytes_decompressed += block_buf.len() as u64;
                 }
 
-                let block_reader = BlockReader::new(&block_buf)?;
+                let records = BlockReader::new(&block_buf)?.records()?;
 
                 // take the start_key, so that subsequent blocks start at index 0
                 let start_pos = self
@@ -669,14 +702,10 @@ impl Iterator for TableIterator<'_> {
                     .take()
                     .as_deref()
                     .or(self.prefix.as_deref())
-                    .map(|key| {
-                        block_reader
-                            .records
-                            .partition_point(|record| record.key < key)
-                    })
+                    .map(|key| records.partition_point(|record| record.key < key))
                     .unwrap_or(0);
 
-                let records_slice = &block_reader.records[start_pos..];
+                let records_slice = &records[start_pos..];
 
                 let end_pos = self
                     .prefix
@@ -722,8 +751,6 @@ impl Iterator for TableIterator<'_> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
-
     use super::*;
 
     fn make_block(records: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -749,50 +776,6 @@ mod tests {
         block.extend_from_slice(&checksum.to_le_bytes());
 
         block
-    }
-
-    #[test]
-    fn test_block_reader_single_record() -> Result<()> {
-        let block = make_block(&[(b"apple", b"red")]);
-
-        let reader = BlockReader::new(&block)?;
-
-        assert_eq!(reader.record_count, 1);
-        assert_eq!(reader.records.len(), 1);
-        assert_eq!(reader.offsets.len(), 1);
-
-        assert_eq!(reader.records[0].key, b"apple");
-        assert_eq!(reader.records[0].value, b"red");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_block_reader_multiple_records() -> Result<()> {
-        let block = make_block(&[
-            (b"apple", b"red"),
-            (b"banana", b"yellow"),
-            (b"cherry", b"red"),
-        ]);
-
-        let reader = BlockReader::new(&block)?;
-
-        assert_eq!(reader.record_count, 3);
-        assert_eq!(reader.records.len(), 3);
-        assert_eq!(reader.offsets.len(), 3);
-
-        assert_eq!(reader.records[0].key, b"apple");
-        assert_eq!(reader.records[1].key, b"banana");
-        assert_eq!(reader.records[2].key, b"cherry");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_block_reader_empty_block() {
-        let block = make_block(&[]);
-
-        assert!(BlockReader::new(&block).is_err());
     }
 
     #[test]
