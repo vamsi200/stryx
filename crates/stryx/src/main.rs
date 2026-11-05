@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         compression: Compression::Zstd,
         key_order: stryx::config::KeyOrder::Lexicographic,
         duplicate_policy: DuplicatePolicy::Allow,
-        filter_type: FilterType::BinaryFuse16,
+        filter_type: FilterType::BinaryFuse32,
         // block_size: 64,
         ..TableOptions::default()
     };

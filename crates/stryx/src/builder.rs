@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use xorf::{BinaryFuse8, BinaryFuse16};
+use xorf::{BinaryFuse8, BinaryFuse16, BinaryFuse32};
 
 use crate::{
     FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
@@ -114,12 +114,14 @@ pub enum FilterTypeRepr {
     None = 0,
     BinaryFuse8 = 1,
     BinaryFuse16 = 2,
+    BinaryFuse32 = 3,
 }
 
 pub fn from_filter_type(val: u8) -> Option<FilterTypeRepr> {
     match val {
         1 => Some(FilterTypeRepr::BinaryFuse8),
         2 => Some(FilterTypeRepr::BinaryFuse16),
+        3 => Some(FilterTypeRepr::BinaryFuse32),
         _ => None,
     }
 }
@@ -129,24 +131,7 @@ pub enum XorFilter {
     None,
     BinaryFuse8(BinaryFuse8),
     BinaryFuse16(BinaryFuse16),
-}
-
-pub(crate) struct FilterData8 {
-    pub seed: u64,
-    pub segment_length: u32,
-    pub segment_length_mask: u32,
-    pub segment_count_length: u32,
-    pub fingerprint_length: u32,
-    pub fingerprints: Box<[u8]>,
-}
-
-pub(crate) struct FilterData16 {
-    pub seed: u64,
-    pub segment_length: u32,
-    pub segment_length_mask: u32,
-    pub segment_count_length: u32,
-    pub fingerprint_length: u32,
-    pub fingerprints: Box<[u16]>,
+    BinaryFuse32(BinaryFuse32),
 }
 
 pub(crate) struct FilterSection {
@@ -395,12 +380,17 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
                 BinaryFuse16::try_from(&self.filter_hashes)
                     .map_err(|_| DecodeError::FilterFailed)?,
             ),
+            FilterType::BinaryFuse32 => XorFilter::BinaryFuse32(
+                BinaryFuse32::try_from(&self.filter_hashes)
+                    .map_err(|_| DecodeError::FilterFailed)?,
+            ),
         };
 
         let filter_type_repr = match filter {
             XorFilter::None => FilterTypeRepr::None,
             XorFilter::BinaryFuse8(_) => FilterTypeRepr::BinaryFuse8,
             XorFilter::BinaryFuse16(_) => FilterTypeRepr::BinaryFuse16,
+            XorFilter::BinaryFuse32(_) => FilterTypeRepr::BinaryFuse32,
         };
 
         let filter_section = filter_encode(filter)?;

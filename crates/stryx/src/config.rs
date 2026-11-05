@@ -34,6 +34,7 @@ pub enum FilterType {
     None,
     BinaryFuse8,
     BinaryFuse16,
+    BinaryFuse32,
 }
 
 #[repr(u8)]
