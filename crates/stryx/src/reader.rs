@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{Read, Seek},
+    os::unix::fs::FileExt,
     path::Path,
     vec,
 };
@@ -23,7 +24,6 @@ pub(crate) struct BlockReader<'a> {
     buf: &'a [u8],
     offsets: &'a [u8],
     record_count: usize,
-    checksum: u32,
 }
 
 impl<'a> BlockReader<'a> {
@@ -33,13 +33,6 @@ impl<'a> BlockReader<'a> {
         }
 
         let buf_len = buf.len();
-
-        // last 4 bytes contain checksum in the Data Block
-        let stored_checksum = u32::from_le_bytes(
-            buf[buf_len - 4..buf_len]
-                .try_into()
-                .map_err(DecodeError::from)?,
-        );
 
         let record_count = u32::from_le_bytes(
             buf[buf_len - 8..buf_len - 4]
@@ -57,15 +50,10 @@ impl<'a> BlockReader<'a> {
             .checked_sub(table_len)
             .ok_or(DecodeError::InvalidLength)?;
 
-        if crc32c::crc32c(&buf[..buf_len - 4]) != stored_checksum {
-            return Err(StryxError::InvalidChecksum);
-        }
-
         Ok(Self {
             buf: &buf[..records_end],
             offsets: &buf[records_end..buf_len - 8],
             record_count,
-            checksum: stored_checksum,
         })
     }
 
@@ -96,6 +84,20 @@ impl<'a> BlockReader<'a> {
         let val = self.buf.get(val_start..end).ok_or(DecodeError::Truncated)?;
 
         Ok((key, val))
+    }
+
+    fn verify_checksum(buf: &[u8]) -> Result<(), StryxError> {
+        let n = buf.len();
+        if n < 8 {
+            return Err(DecodeError::InvalidLength.into());
+        }
+
+        // last 4 bytes contain checksum in the Data Block
+        let stored = u32::from_le_bytes(buf[n - 4..].try_into().unwrap());
+        if crc32c::crc32c(&buf[..n - 4]) != stored {
+            return Err(StryxError::InvalidChecksum);
+        }
+        Ok(())
     }
 
     // binary search the key
@@ -136,6 +138,8 @@ pub struct TableReader {
     metadata: TableMetadata,
     readstats: ReadStats,
     filter: XorFilter,
+    block_buf: Vec<u8>,
+    crc_verification: Vec<bool>,
 }
 
 impl TableReader {
@@ -243,8 +247,7 @@ impl TableReader {
         let index_len = usize::try_from(index_size)?;
         let mut index_buf = vec![0u8; index_len];
 
-        file.seek(std::io::SeekFrom::Start(index_offset))?;
-        file.read_exact(&mut index_buf)?;
+        file.read_exact_at(&mut index_buf, index_offset)?;
 
         if index_buf.len() < 8 {
             return Err(DecodeError::Truncated.into());
@@ -277,12 +280,16 @@ impl TableReader {
             return Err(DecodeError::InvalidLength.into());
         }
 
+        let crc_verification = vec![false; index_entries.len()];
+
         Ok(TableReader {
             file,
             index: index_entries,
             metadata,
             readstats: ReadStats::default(),
             filter,
+            block_buf: Vec::new(),
+            crc_verification,
         })
     }
 
@@ -324,19 +331,30 @@ impl TableReader {
             (entry.offset, entry.size)
         };
 
-        let mut block_buf = vec![0u8; size as usize];
-
-        self.file.seek(std::io::SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut block_buf)?;
+        self.block_buf.resize(size as usize, 0);
+        self.file.read_exact_at(&mut self.block_buf, offset)?;
 
         self.readstats.blocks_read += 1;
         self.readstats.bytes_read += u64::from(size);
 
-        let (block_buf, decompressed) = decompress_block(self.metadata.compression, block_buf)?;
+        let (block_buf, decompressed) =
+            decompress_block(self.metadata.compression, &self.block_buf)?;
 
         if decompressed {
             self.readstats.blocks_decompressed += 1;
             self.readstats.bytes_decompressed += block_buf.len() as u64;
+        }
+
+        let idx = block - 1;
+
+        if !self.crc_verification[idx] {
+            if let Err(e) = BlockReader::verify_checksum(&block_buf) {
+                if matches!(e, StryxError::InvalidChecksum) {
+                    self.readstats.checksum_failures += 1;
+                }
+                return Err(e);
+            }
+            self.crc_verification[idx] = true;
         }
 
         let reader = match BlockReader::new(&block_buf) {
@@ -457,13 +475,13 @@ impl TableReader {
 /// Returns the decoded bytes and whether decompression was performed.
 fn decompress_block(
     compression: Compression,
-    block_buf: Vec<u8>,
+    block_buf: &[u8],
 ) -> Result<(Vec<u8>, bool), StryxError> {
     match compression {
-        Compression::None => Ok((block_buf, false)),
-        Compression::Zstd => Ok((zstd::decode_all(block_buf.as_slice())?, true)),
+        Compression::None => Ok((block_buf.to_vec(), false)),
+        Compression::Zstd => Ok((zstd::decode_all(block_buf)?, true)),
         Compression::Lz4 => {
-            let mut decoder = lz4::Decoder::new(block_buf.as_slice())?;
+            let mut decoder = lz4::Decoder::new(block_buf)?;
 
             let mut output = Vec::new();
             decoder.read_to_end(&mut output)?;
@@ -680,14 +698,12 @@ impl Iterator for TableIterator<'_> {
             let mut block_buf = vec![0u8; size as usize];
 
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
-                self.reader.file.seek(std::io::SeekFrom::Start(offset))?;
-
-                self.reader.file.read_exact(&mut block_buf)?;
+                self.reader.file.read_exact_at(&mut block_buf, offset)?;
 
                 self.reader.readstats.blocks_read += 1;
                 self.reader.readstats.bytes_read += u64::from(size);
 
-                let (block_buf, decompressed) = decompress_block(self.compression, block_buf)?;
+                let (block_buf, decompressed) = decompress_block(self.compression, &block_buf)?;
 
                 if decompressed {
                     self.reader.readstats.blocks_decompressed += 1;
@@ -798,6 +814,6 @@ mod tests {
 
         block[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
 
-        assert!(BlockReader::new(&block).is_err());
+        assert!(BlockReader::verify_checksum(&block).is_err() || BlockReader::new(&block).is_err());
     }
 }
