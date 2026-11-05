@@ -13,4 +13,3 @@ lz4 = "1.28.1"
 spillsort = "0.2.0"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 xorf = { version = "0.13.0", features = ["serde"] }
-serde = { version = "1.0.229", features = ["derive"] }

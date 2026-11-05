@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("starting..");
 
-    let key = records[999].key;
+    let key = records[99].key;
 
     table.add_batch(records);
     let (_, stats) = table.finalize()?;
@@ -75,29 +75,5 @@ fn main() -> anyhow::Result<()> {
     println!("Total: {:?}", elapsed);
     println!("Average: {:?}", elapsed / iterations);
 
-    // println!(
-    //     "{:?}",
-    //     reader.get_many(&[&keys[88], &keys[80], &keys[12], &keys[10]])?
-    // );
-    // for key in &keys {
-    //     black_box(reader.get(black_box(key))?);
-    // }
-
-    //
-    // write_to_file(&mut file, &output)?;
-
-    // let mut start = Instant::now();
-    // let mut buf = Vec::new();
-    //
-    // file.read_to_end(&mut buf)?;
-    //
-    // let mut record_reader = RecordReader::new(&buf);
-    //
-    // let mut record_count = 0;
-    // while let Some(record) = record_reader.next_record()? {
-    //     std::hint::black_box(record);
-    // }
-
-    // println!("elapsed: {:?}", start.elapsed());
     Ok(())
 }

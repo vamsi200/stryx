@@ -11,7 +11,7 @@ use rand::{RngExt, SeedableRng};
 
 use crate::VERSION;
 use crate::builder::{Record, TableBuilder};
-use crate::config::{Compression, DuplicatePolicy, KeyOrder, TableOptions};
+use crate::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
 use crate::error::StryxError;
 use crate::reader::{OwnedRecord, TableReader};
 
@@ -23,7 +23,7 @@ struct TestTable {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-fn test_path() -> PathBuf {
+pub(crate) fn test_path() -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     std::env::temp_dir().join(format!("stryx-test-{}-{id}.stryx", std::process::id()))
@@ -912,5 +912,777 @@ fn test_invalid_footer_magic() -> TestResult {
     assert_matches!(TableReader::open(&path), Err(StryxError::InvalidMagic));
 
     std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_missing_key_binary_fuse8() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(b"missing_key_xyz")?, None);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_missing_key_binary_fuse16() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse16,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(b"missing_key_xyz")?, None);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_existing_key_binary_fuse8() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(b"apple")?.as_deref(), Some(b"red".as_slice()));
+    assert_eq!(
+        reader.get(b"banana")?.as_deref(),
+        Some(b"yellow".as_slice())
+    );
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_existing_key_binary_fuse16() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse16,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(b"apple")?.as_deref(), Some(b"red".as_slice()));
+    assert_eq!(
+        reader.get(b"banana")?.as_deref(),
+        Some(b"yellow".as_slice())
+    );
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_empty_table() -> TestResult {
+    for filter_type in [
+        FilterType::BinaryFuse8,
+        FilterType::BinaryFuse16,
+        FilterType::BinaryFuse32,
+    ] {
+        let path = test_path();
+
+        let options = TableOptions {
+            filter_type,
+            ..TableOptions::default()
+        };
+
+        let table = TableBuilder::create(&path, options)?;
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+
+        assert_eq!(reader.metadata().record_count, 0);
+        assert_eq!(reader.get(b"nonexistent")?, None);
+        assert!(!reader.contains_key(b"nonexistent")?);
+
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_filter_disabled() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::None,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert_eq!(reader.get(b"apple")?.as_deref(), Some(b"red".as_slice()));
+    assert_eq!(
+        reader.get(b"banana")?.as_deref(),
+        Some(b"yellow".as_slice())
+    );
+    assert_eq!(reader.get(b"missing")?, None);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_with_compression() -> TestResult {
+    for compression in [Compression::Lz4, Compression::Zstd] {
+        let path = test_path();
+
+        let options = TableOptions {
+            compression,
+            filter_type: FilterType::BinaryFuse8,
+            ..TableOptions::default()
+        };
+
+        let mut table = TableBuilder::create(&path, options)?;
+        table.add(b"apple", b"red")?;
+        table.add(b"banana", b"yellow")?;
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+
+        assert_eq!(reader.get(b"apple")?.as_deref(), Some(b"red".as_slice()));
+        assert_eq!(
+            reader.get(b"banana")?.as_deref(),
+            Some(b"yellow".as_slice())
+        );
+        assert_eq!(reader.get(b"missing")?, None);
+
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_filter_with_duplicate_allowance() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        duplicate_policy: DuplicatePolicy::Allow,
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"first")?;
+    table.add(b"apple", b"second")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    assert!(reader.get(b"apple")?.is_some());
+    assert_eq!(
+        reader.get(b"banana")?.as_deref(),
+        Some(b"yellow".as_slice())
+    );
+    assert_eq!(reader.get(b"missing")?, None);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_filter_negative_lookup_bypasses_data_and_index_reads() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse16,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    for i in 0..1000u32 {
+        let key = format!("present-key-{i:06}");
+        let value = format!("value-{i:06}");
+        table.add(key.as_bytes(), value.as_bytes())?;
+    }
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    let initial_stats = reader.stats();
+    assert_eq!(initial_stats.blocks_read, 0);
+
+    let result = reader.get(b"definitely_missing_key_that_filter_rejects")?;
+    assert_eq!(result, None);
+
+    let stats_after = reader.stats();
+    assert_eq!(stats_after.blocks_read, 0);
+    assert_eq!(stats_after.blocks_decompressed, 0);
+    assert_eq!(stats_after.point_misses, 1);
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_range_empty_key_mismatch() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        block_size: 64, // Small block size to force multiple blocks
+        duplicate_policy: DuplicatePolicy::Allow,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+
+    table.add(b"", b"val1")?;
+    table.add(b"", b"val2")?;
+    table.add(b"apple", b"val3")?;
+    table.add(b"banana", b"val4")?;
+    table.add(b"cherry", b"val5")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(&path)?;
+
+    let records: Vec<_> = reader
+        .range(b"", b"cherry")?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Expected: ["", "", "apple", "banana"] -> 4 records
+    assert_eq!(records.len(), 4, "Records: {records:?}");
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_combo_compression_and_data_checksum_verification() -> TestResult {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+        let path = test_path();
+
+        let options = TableOptions {
+            compression,
+            block_size: 128,
+            ..TableOptions::default()
+        };
+
+        let mut table = TableBuilder::create(&path, options)?;
+        for i in 0..50u32 {
+            let key = format!("key-{i:04}");
+            let val = format!("value-payload-for-compression-{i:04}");
+            table.add(key.as_bytes(), val.as_bytes())?;
+        }
+        table.finalize()?;
+
+        {
+            let mut reader = TableReader::open(&path)?;
+            assert_eq!(
+                reader.get(b"key-0025")?.as_deref(),
+                Some(b"value-payload-for-compression-0025".as_slice())
+            );
+        }
+
+        let mut bytes = std::fs::read(&path)?;
+        bytes[4] ^= 0xFF;
+        std::fs::write(&path, bytes)?;
+
+        let mut reader = TableReader::open(&path)?;
+        assert!(reader.get(b"key-0000").is_err());
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_combo_filter_and_duplicate_spanning_blocks() -> TestResult {
+    for filter_type in [
+        FilterType::BinaryFuse8,
+        FilterType::BinaryFuse16,
+        FilterType::BinaryFuse32,
+    ] {
+        let path = test_path();
+
+        let options = TableOptions {
+            filter_type,
+            duplicate_policy: DuplicatePolicy::Allow,
+            key_order: KeyOrder::Lexicographic,
+            block_size: 64,
+            ..TableOptions::default()
+        };
+
+        let mut table = TableBuilder::create(&path, options)?;
+        // Add unsorted duplicates to test Sorting, Duplicate, Filter and Small Block Size together
+        for i in 0..20u32 {
+            table.add(b"dup-key", format!("val-{i:02}").as_bytes())?;
+            table.add(b"aaa-key", format!("first-{i:02}").as_bytes())?;
+            table.add(b"zzz-key", format!("last-{i:02}").as_bytes())?;
+        }
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+
+        assert_eq!(reader.metadata().record_count, 60);
+        assert!(reader.contains_key(b"dup-key")?);
+        assert!(reader.contains_key(b"aaa-key")?);
+        assert!(reader.contains_key(b"zzz-key")?);
+        assert!(!reader.contains_key(b"missing-key")?);
+
+        let dup_records: Vec<_> = reader.prefix(b"dup-key")?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(dup_records.len(), 20);
+
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_combo_block_size_mixed_large_and_small_records() -> TestResult {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+        let path = test_path();
+
+        let options = TableOptions {
+            block_size: 128,
+            compression,
+            filter_type: FilterType::BinaryFuse16,
+            ..TableOptions::default()
+        };
+
+        let small_val = b"tiny".to_vec();
+        let huge_val = vec![b'X'; 8192]; // larger than target block_size
+
+        let mut table = TableBuilder::create(&path, options)?;
+        table.add(b"k1-small", &small_val)?;
+        table.add(b"k2-huge", &huge_val)?;
+        table.add(b"k3-small", &small_val)?;
+        table.add(b"k4-huge", &huge_val)?;
+        table.add(b"k5-small", &small_val)?;
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+
+        assert_eq!(reader.get(b"k1-small")?, Some(small_val.clone()));
+        assert_eq!(reader.get(b"k2-huge")?, Some(huge_val.clone()));
+        assert_eq!(reader.get(b"k3-small")?, Some(small_val.clone()));
+        assert_eq!(reader.get(b"k4-huge")?, Some(huge_val.clone()));
+        assert_eq!(reader.get(b"k5-small")?, Some(small_val.clone()));
+
+        let range_res: Vec<_> = reader
+            .range(b"k1-small", b"k5-small")?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(range_res.len(), 4);
+        assert_eq!(range_res[1].value, huge_val);
+        assert_eq!(range_res[3].value, huge_val);
+
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_combo_curated_option_matrix() -> TestResult {
+    let matrix = [
+        (
+            64,
+            Compression::None,
+            FilterType::BinaryFuse8,
+            DuplicatePolicy::Reject,
+            KeyOrder::Presorted,
+        ),
+        (
+            128,
+            Compression::Lz4,
+            FilterType::BinaryFuse16,
+            DuplicatePolicy::Allow,
+            KeyOrder::Lexicographic,
+        ),
+        (
+            256,
+            Compression::Zstd,
+            FilterType::BinaryFuse32,
+            DuplicatePolicy::Reject,
+            KeyOrder::Lexicographic,
+        ),
+        (
+            512,
+            Compression::Lz4,
+            FilterType::None,
+            DuplicatePolicy::Allow,
+            KeyOrder::Presorted,
+        ),
+    ];
+
+    for (block_size, compression, filter_type, duplicate_policy, key_order) in matrix {
+        let path = test_path();
+
+        let options = TableOptions {
+            block_size,
+            compression,
+            filter_type,
+            duplicate_policy: duplicate_policy.clone(),
+            key_order,
+            ..TableOptions::default()
+        };
+
+        let mut table = TableBuilder::create(&path, options)?;
+
+        let mut keys = vec![b"beta".as_slice(), b"alpha", b"gamma", b"delta"];
+        if matches!(key_order, KeyOrder::Presorted) {
+            keys.sort();
+        }
+
+        for k in &keys {
+            table.add(k, b"v1")?;
+            if matches!(duplicate_policy, DuplicatePolicy::Allow) {
+                table.add(k, b"v2")?;
+            }
+        }
+
+        table.finalize()?;
+
+        let mut reader = TableReader::open(&path)?;
+        for k in &keys {
+            assert!(reader.contains_key(k)?);
+            assert!(reader.get(k)?.is_some());
+        }
+        assert!(!reader.contains_key(b"omega")?);
+
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
+}
+
+fn replace_u64_in_slice(bytes: &mut [u8], old_val: u64, new_val: u64) -> bool {
+    let target = old_val.to_le_bytes();
+    if let Some(pos) = bytes.windows(8).rposition(|w| w == target) {
+        bytes[pos..pos + 8].copy_from_slice(&new_val.to_le_bytes());
+        true
+    } else {
+        false
+    }
+}
+
+fn replace_u32_in_slice(bytes: &mut [u8], old_val: u32, new_val: u32) -> bool {
+    let target = old_val.to_le_bytes();
+    if let Some(pos) = bytes.windows(4).rposition(|w| w == target) {
+        bytes[pos..pos + 4].copy_from_slice(&new_val.to_le_bytes());
+        true
+    } else {
+        false
+    }
+}
+
+#[test]
+fn test_robustness_randomly_mutated_files() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        compression: Compression::Lz4,
+        filter_type: FilterType::BinaryFuse8,
+        block_size: 64,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    for i in 0..30u32 {
+        table.add(format!("key-{i:04}").as_bytes(), b"some_value_payload")?;
+    }
+    table.finalize()?;
+
+    let original_bytes = std::fs::read(&path)?;
+    let mut rng = StdRng::seed_from_u64(12345);
+
+    for _ in 0..100 {
+        let mut mutated = original_bytes.clone();
+        let pos = rng.random_range(0..mutated.len());
+        mutated[pos] ^= rng.random_range(1..=255);
+
+        std::fs::write(&path, &mutated)?;
+
+        if let Ok(mut reader) = TableReader::open(&path) {
+            let _ = reader.get(b"key-0005");
+            let _ = reader.contains_key(b"key-0010");
+            let _ = reader.prefix(b"key-").map(|it| it.collect::<Vec<_>>());
+            let _ = reader
+                .range(b"key-0000", b"key-0020")
+                .map(|it| it.collect::<Vec<_>>());
+            let _ = reader.iter().collect::<Vec<_>>();
+        }
+    }
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_robustness_offsets_pointing_outside_file() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let reader = TableReader::open(&path)?;
+    let meta = reader.metadata().clone();
+    drop(reader);
+
+    let original = std::fs::read(&path)?;
+    let tail_start = meta.index_offset as usize;
+
+    let mut bytes = original.clone();
+    assert!(replace_u64_in_slice(
+        &mut bytes[tail_start..],
+        meta.index_offset,
+        meta.file_size + 1024
+    ));
+    std::fs::write(&path, &bytes)?;
+    assert!(TableReader::open(&path).is_err());
+
+    let mut bytes = original;
+    assert!(replace_u64_in_slice(
+        &mut bytes[tail_start..],
+        meta.index_size,
+        meta.file_size + 1024
+    ));
+    std::fs::write(&path, &bytes)?;
+    assert!(TableReader::open(&path).is_err());
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_robustness_integer_overflow_in_lengths_and_offsets() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.finalize()?;
+
+    let reader = TableReader::open(&path)?;
+    let meta = reader.metadata().clone();
+    drop(reader);
+
+    let original = std::fs::read(&path)?;
+    let tail_start = meta.index_offset as usize;
+
+    // set index_size to u64::MAX so index_offset + index_size overflows u64
+    let mut bytes = original.clone();
+    assert!(replace_u64_in_slice(
+        &mut bytes[tail_start..],
+        meta.index_size,
+        u64::MAX
+    ));
+    std::fs::write(&path, &bytes)?;
+    assert!(TableReader::open(&path).is_err());
+
+    // set index_offset to u64::MAX so index_offset + index_size overflows u64
+    let mut bytes = original;
+    assert!(replace_u64_in_slice(
+        &mut bytes[tail_start..],
+        meta.index_offset,
+        u64::MAX
+    ));
+    std::fs::write(&path, &bytes)?;
+    assert!(TableReader::open(&path).is_err());
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+#[test]
+fn test_robustness_invalid_enum_discriminants() -> TestResult {
+    let path = test_path();
+
+    let options = TableOptions {
+        compression: Compression::Lz4,
+        filter_type: FilterType::BinaryFuse8,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(&path, options)?;
+    table.add(b"apple", b"red")?;
+    table.finalize()?;
+
+    let reader = TableReader::open(&path)?;
+    let meta = reader.metadata().clone();
+    drop(reader);
+
+    let original = std::fs::read(&path)?;
+    let post_index_start = (meta.index_offset + meta.index_size) as usize;
+    let footer_magic_start = original.len() - 8;
+
+    // Overwrite every single byte after the index (covering filter_type, compression, index_type) with 0xFE
+    for pos in post_index_start..footer_magic_start {
+        let mut bytes = original.clone();
+        if bytes[pos] == 0xFE {
+            continue;
+        }
+        bytes[pos] = 0xFE;
+        std::fs::write(&path, &bytes)?;
+
+        if let Ok(mut r) = TableReader::open(&path) {
+            let _ = r.get(b"apple");
+            let _ = r.iter().collect::<Vec<_>>();
+        }
+    }
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_robustness_inconsistent_metadata_and_index_counts() -> TestResult {
+    let path = test_path();
+
+    let mut table = TableBuilder::create(&path, TableOptions::default())?;
+    for i in 0..5u32 {
+        table.add(format!("key-{i}").as_bytes(), b"value")?;
+    }
+    table.finalize()?;
+
+    let reader = TableReader::open(&path)?;
+    let meta = reader.metadata().clone();
+    drop(reader);
+
+    let original = std::fs::read(&path)?;
+    let post_index = (meta.index_offset + meta.index_size) as usize;
+
+    // Corrupt block_count in the metadata/footer to claim 500 blocks exist when only 1 was the actual
+    let mut bytes = original.clone();
+    if replace_u32_in_slice(&mut bytes[post_index..], meta.block_count, 500) {
+        std::fs::write(&path, &bytes)?;
+        if let Ok(mut r) = TableReader::open(&path) {
+            let _ = r.iter().collect::<Vec<_>>();
+        }
+    }
+
+    // Corrupt block_count to 0 when 1 block exists
+    let mut bytes = original;
+    if replace_u32_in_slice(&mut bytes[post_index..], meta.block_count, 0) {
+        std::fs::write(&path, &bytes)?;
+        if let Ok(mut r) = TableReader::open(&path) {
+            let _ = r.get(b"key-0");
+            let _ = r.iter().collect::<Vec<_>>();
+        }
+    }
+
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+#[test]
+fn test_robustness_filter_lengths_exceeding_remaining_file_size() -> TestResult {
+    let path_no_filter = test_path();
+    let path_with_filter = test_path();
+
+    // Build identical table without filter and with filter to locate the filter section
+    let mut t1 = TableBuilder::create(
+        &path_no_filter,
+        TableOptions {
+            filter_type: FilterType::None,
+            ..TableOptions::default()
+        },
+    )?;
+    t1.add(b"apple", b"red")?;
+    t1.add(b"banana", b"yellow")?;
+    t1.finalize()?;
+
+    let mut t2 = TableBuilder::create(
+        &path_with_filter,
+        TableOptions {
+            filter_type: FilterType::BinaryFuse8,
+            ..TableOptions::default()
+        },
+    )?;
+    t2.add(b"apple", b"red")?;
+    t2.add(b"banana", b"yellow")?;
+    t2.finalize()?;
+
+    let bytes_no_filter = std::fs::read(&path_no_filter)?;
+    let bytes_with_filter = std::fs::read(&path_with_filter)?;
+
+    let filter_section_len = bytes_with_filter.len() - bytes_no_filter.len();
+    assert!(filter_section_len > 24);
+
+    // Find the first byte where the two files diverge (the start of the filter section)
+    let filter_start = bytes_no_filter
+        .iter()
+        .zip(&bytes_with_filter)
+        .position(|(a, b)| a != b)
+        .expect("files with and without filter must differ");
+
+    let mut corrupted = bytes_with_filter.clone();
+
+    // BinaryFuse header layout: seed (8) + seg_len (4) + mask (4) + seg_count_len (4) + fp_len (4)
+    // Overwrite `fp_len` at filter_start + 20 with a length larger than the file
+    let fp_len_offset = filter_start + 20;
+    let bogus_fp_len = (corrupted.len() as u32) + 50_000;
+    corrupted[fp_len_offset..fp_len_offset + 4].copy_from_slice(&bogus_fp_len.to_le_bytes());
+
+    // Recompute the filter CRC32C checksum, so it passes checksum
+    // verification and directly hits `decode_fuse8`'s remaining-length validation
+    let filter_data_end = filter_start + filter_section_len - 4;
+    let new_crc = crc32c::crc32c(&corrupted[filter_start..filter_data_end]);
+    corrupted[filter_data_end..filter_data_end + 4].copy_from_slice(&new_crc.to_le_bytes());
+
+    std::fs::write(&path_with_filter, &corrupted)?;
+
+    assert!(TableReader::open(&path_with_filter).is_err());
+
+    std::fs::remove_file(path_no_filter)?;
+    std::fs::remove_file(path_with_filter)?;
     Ok(())
 }

@@ -16,6 +16,9 @@ pub enum DecodeError {
 
     #[error("Failed to create Fuse Filter")]
     FilterFailed,
+
+    #[error("Invalid Filter Type")]
+    InvalidFilterType,
 }
 
 #[derive(Debug, thiserror::Error)]

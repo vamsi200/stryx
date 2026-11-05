@@ -111,6 +111,12 @@ impl TableReader {
     /// Open and validate an SSTable
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StryxError> {
         let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+
+        if file_len < FOOTER_SIZE as u64 {
+            return Err(DecodeError::Truncated.into());
+        }
+
         let mut footer = [0u8; FOOTER_SIZE];
 
         file.seek(std::io::SeekFrom::End(-(FOOTER_SIZE as i64)))?;
@@ -124,16 +130,44 @@ impl TableReader {
 
         let index_offset = decoder.read_u64()?;
         let index_size = decoder.read_u64()?;
-        let filter_type = from_filter_type(decoder.read_u8()?);
+        let filter_type = from_filter_type(decoder.read_u8()?)?;
         let version = decoder.read_u32()?;
 
-        // metadata starts right afer encoded_index, so offset is just:
-        let metadata_offset = index_offset + index_size;
+        if version != VERSION {
+            return Err(StryxError::InvalidVersion);
+        }
+
+        let footer_offset = file_len - FOOTER_SIZE as u64;
+
+        let metadata_offset = index_offset
+            .checked_add(index_size)
+            .ok_or(DecodeError::InvalidLength)?;
+
+        if metadata_offset > footer_offset {
+            return Err(DecodeError::InvalidLength.into());
+        }
+
         file.seek(std::io::SeekFrom::Start(metadata_offset))?;
 
         let mut len_buf = [0u8; 8];
         file.read_exact(&mut len_buf)?;
         let metadata_size = u64::from_le_bytes(len_buf);
+
+        // validate bounds before allocating metadata_buf
+        let filter_section_offset = metadata_offset
+            .checked_add(8)
+            .and_then(|v| v.checked_add(metadata_size))
+            .ok_or(DecodeError::InvalidLength)?;
+
+        if matches!(filter_type, FilterTypeRepr::None) {
+            if filter_section_offset != footer_offset {
+                return Err(DecodeError::InvalidLength.into());
+            }
+        }
+
+        if filter_section_offset > footer_offset {
+            return Err(DecodeError::InvalidLength.into());
+        }
 
         let mut metadata_buf = vec![0u8; usize::try_from(metadata_size)?];
         file.read_exact(&mut metadata_buf)?;
@@ -141,12 +175,15 @@ impl TableReader {
 
         let mut filter = XorFilter::None;
 
-        if let Some(ft) = filter_type {
-            let filter_section_offset = metadata_offset + 8 + metadata_size;
+        if filter_type != FilterTypeRepr::None {
+            let filter_overhead = filter_section_offset
+                .checked_add(8 + 4 + FOOTER_SIZE as u64)
+                .ok_or(DecodeError::InvalidLength)?;
+
             let remaining = file
                 .metadata()?
                 .len()
-                .checked_sub(filter_section_offset + 8 + 4 + FOOTER_SIZE as u64)
+                .checked_sub(filter_overhead)
                 .ok_or(DecodeError::InvalidLength)?;
 
             file.seek(std::io::SeekFrom::Start(filter_section_offset))?;
@@ -170,13 +207,10 @@ impl TableReader {
                 return Err(StryxError::InvalidFilterChecksum);
             }
 
-            filter = filter_decode(&filter_data, ft)?;
+            filter = filter_decode(&filter_data, filter_type)?;
         }
 
-        if version != VERSION {
-            return Err(StryxError::InvalidVersion);
-        }
-
+        // `index_size` is guaranteed <= `footer_offset`, so this is fine
         let index_len = usize::try_from(index_size)?;
         let mut index_buf = vec![0u8; index_len];
 
@@ -236,6 +270,7 @@ impl TableReader {
     /// Find the value associated with a key.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
         if !self.xorf_contains(key) {
+            self.readstats.point_misses += 1;
             return Ok(None);
         }
 
@@ -328,7 +363,14 @@ impl TableReader {
             .index
             .partition_point(|entry| entry.first_key.as_slice() <= start);
 
-        let block_idx = block.saturating_sub(1);
+        let mut block_idx = block.saturating_sub(1);
+
+        // If multiple blocks share first_key == start (allowed with duplicate keys),
+        // rewind to the very first block that could contain `start`.
+        while block_idx > 0 && self.index[block_idx - 1].first_key.as_slice() == start {
+            block_idx -= 1;
+        }
+
         let compression = self.metadata.compression;
 
         self.readstats.range_queries += 1;
@@ -621,8 +663,10 @@ impl Iterator for TableIterator<'_> {
 
                 let block_reader = BlockReader::new(&block_buf)?;
 
+                // take the start_key, so that subsequent blocks start at index 0
                 let start_pos = self
                     .start_key
+                    .take()
                     .as_deref()
                     .or(self.prefix.as_deref())
                     .map(|key| {

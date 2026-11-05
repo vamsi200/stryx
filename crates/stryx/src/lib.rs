@@ -13,5 +13,3 @@ pub const MAGIC: &[u8; 8] = b"STRYX001";
 pub const VERSION: u32 = 1;
 pub const KEY_HASH_SEED: u64 = 0;
 pub const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-
-// helpers

@@ -1,7 +1,7 @@
 //TableConfig or Options whichever
 use crate::BLOCK_SIZE;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableOptions {
     /// Target encoded data block size in bytes
     pub block_size: usize,
@@ -23,12 +23,9 @@ pub struct TableOptions {
 
     /// Filter type
     pub filter_type: FilterType,
-
-    /// Number of records between prefix-compression restart points
-    pub restart_interval: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub enum FilterType {
     #[default]
     None,
@@ -46,13 +43,13 @@ pub enum Compression {
     Zstd = 2,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub enum Checksum {
     #[default]
     Crc32c,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub enum IndexType {
     #[default]
     Sparse,
@@ -68,7 +65,7 @@ pub enum KeyOrder {
     Lexicographic,
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub enum DuplicatePolicy {
     #[default]
     Reject,
@@ -85,7 +82,6 @@ impl Default for TableOptions {
             index_type: IndexType::default(),
             key_order: KeyOrder::default(),
             duplicate_policy: DuplicatePolicy::default(),
-            restart_interval: 0,
         }
     }
 }

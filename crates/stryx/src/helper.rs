@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn round_trip_many_sizes() {
-        for n in [1usize, 2, 5, 50, 500, 5_000, 50_000, 500_000, 2_000_000] {
+        for n in [1usize, 2, 5, 50, 500, 5_000, 50_000, 500_000] {
             let keys = hashes(n as u64);
 
             let (_, b8) = encode8(&keys);

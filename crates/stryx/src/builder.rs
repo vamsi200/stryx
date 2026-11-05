@@ -109,7 +109,7 @@ impl Encode for Record<'_> {
 }
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum FilterTypeRepr {
     None = 0,
     BinaryFuse8 = 1,
@@ -117,15 +117,15 @@ pub enum FilterTypeRepr {
     BinaryFuse32 = 3,
 }
 
-pub fn from_filter_type(val: u8) -> Option<FilterTypeRepr> {
-    match val {
-        1 => Some(FilterTypeRepr::BinaryFuse8),
-        2 => Some(FilterTypeRepr::BinaryFuse16),
-        3 => Some(FilterTypeRepr::BinaryFuse32),
-        _ => None,
+pub fn from_filter_type(byte: u8) -> Result<FilterTypeRepr, DecodeError> {
+    match byte {
+        0 => Ok(FilterTypeRepr::None),
+        1 => Ok(FilterTypeRepr::BinaryFuse8),
+        2 => Ok(FilterTypeRepr::BinaryFuse16),
+        3 => Ok(FilterTypeRepr::BinaryFuse32),
+        _ => Err(DecodeError::InvalidFilterType),
     }
 }
-
 #[derive(Debug)]
 pub enum XorFilter {
     None,
@@ -178,7 +178,7 @@ pub struct TableBuilder<W: Write> {
     record_count: u64,
 
     /// Filter Hashes
-    filter_hashes: Vec<u64>,
+    filter_hashes: Option<Vec<u64>>,
 }
 
 impl TableBuilder<BufWriter<File>> {
@@ -198,6 +198,12 @@ impl TableBuilder<BufWriter<File>> {
             .read(true)
             .open(path)?;
 
+        let filter_hashes = if options.filter_type != FilterType::None {
+            Some(Vec::new())
+        } else {
+            None
+        };
+
         Ok(Self {
             writer: BufWriter::new(file),
             sorter,
@@ -211,7 +217,7 @@ impl TableBuilder<BufWriter<File>> {
             max_key: None,
             block_count: 0,
             record_count: 0,
-            filter_hashes: vec![],
+            filter_hashes,
         })
     }
 }
@@ -224,6 +230,12 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             KeyOrder::Lexicographic => Some(spillsort::Sorter::new(
                 spillsort::Config::default().max_bytes(64 * 1024 * 1024),
             )?),
+        };
+
+        let filter_hashes = if options.filter_type != FilterType::None {
+            Some(Vec::new())
+        } else {
+            None
         };
 
         Ok(Self {
@@ -239,7 +251,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             max_key: None,
             block_count: 0,
             record_count: 0,
-            filter_hashes: vec![],
+            filter_hashes,
         })
     }
 
@@ -255,7 +267,12 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             }
         }
 
-        self.filter_hashes.push(Self::hash_key(key));
+        // hash only when filter_type is some
+        if self.options.filter_type != FilterType::None {
+            if let Some(hashes) = &mut self.filter_hashes {
+                hashes.push(Self::hash_key(key));
+            }
+        }
 
         let record = Record { key, value };
         self.record_count += 1;
@@ -272,7 +289,6 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         if !self.block.is_empty()
             && self.block.size() + encoded_record.len() + size_of::<u32>() > self.options.block_size
         {
-            // println!("Exceeds Block Size, inserting into new one..");
             self.flush_block()?;
         }
 
@@ -291,8 +307,15 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
     /// Append a record
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
         if let Some(sorter) = &mut self.sorter {
-            self.filter_hashes.push(Self::hash_key(key));
             sorter.push(key, value)?;
+
+            // hash only when filter_type is some
+            if self.options.filter_type != FilterType::None {
+                if let Some(hashes) = &mut self.filter_hashes {
+                    hashes.push(Self::hash_key(key));
+                }
+            }
+
             return Ok(());
         }
 
@@ -367,33 +390,35 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         self.flush_block()?;
 
-        self.filter_hashes.sort_unstable();
-        self.filter_hashes.dedup();
+        let mut filter_section = None;
+        let mut filter_type_repr = FilterTypeRepr::None;
 
-        let filter = match self.options.filter_type {
-            FilterType::None => XorFilter::None,
-            FilterType::BinaryFuse8 => XorFilter::BinaryFuse8(
-                BinaryFuse8::try_from(&self.filter_hashes)
-                    .map_err(|_| DecodeError::FilterFailed)?,
-            ),
-            FilterType::BinaryFuse16 => XorFilter::BinaryFuse16(
-                BinaryFuse16::try_from(&self.filter_hashes)
-                    .map_err(|_| DecodeError::FilterFailed)?,
-            ),
-            FilterType::BinaryFuse32 => XorFilter::BinaryFuse32(
-                BinaryFuse32::try_from(&self.filter_hashes)
-                    .map_err(|_| DecodeError::FilterFailed)?,
-            ),
-        };
+        if let Some(mut filter_hashes) = self.filter_hashes.take() {
+            filter_hashes.sort_unstable();
+            filter_hashes.dedup();
 
-        let filter_type_repr = match filter {
-            XorFilter::None => FilterTypeRepr::None,
-            XorFilter::BinaryFuse8(_) => FilterTypeRepr::BinaryFuse8,
-            XorFilter::BinaryFuse16(_) => FilterTypeRepr::BinaryFuse16,
-            XorFilter::BinaryFuse32(_) => FilterTypeRepr::BinaryFuse32,
-        };
+            let filter = match self.options.filter_type {
+                FilterType::None => XorFilter::None,
+                FilterType::BinaryFuse8 => XorFilter::BinaryFuse8(
+                    BinaryFuse8::try_from(filter_hashes).map_err(|_| DecodeError::FilterFailed)?,
+                ),
+                FilterType::BinaryFuse16 => XorFilter::BinaryFuse16(
+                    BinaryFuse16::try_from(filter_hashes).map_err(|_| DecodeError::FilterFailed)?,
+                ),
+                FilterType::BinaryFuse32 => XorFilter::BinaryFuse32(
+                    BinaryFuse32::try_from(filter_hashes).map_err(|_| DecodeError::FilterFailed)?,
+                ),
+            };
 
-        let filter_section = filter_encode(filter)?;
+            filter_type_repr = match filter {
+                XorFilter::None => FilterTypeRepr::None,
+                XorFilter::BinaryFuse8(_) => FilterTypeRepr::BinaryFuse8,
+                XorFilter::BinaryFuse16(_) => FilterTypeRepr::BinaryFuse16,
+                XorFilter::BinaryFuse32(_) => FilterTypeRepr::BinaryFuse32,
+            };
+
+            filter_section = filter_encode(filter)?;
+        }
 
         let statistics = self.statistics();
 
