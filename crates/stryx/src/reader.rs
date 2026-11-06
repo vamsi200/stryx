@@ -6,6 +6,10 @@ use std::{
     io::{Read, Seek},
     os::unix::fs::FileExt,
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    },
     vec,
 };
 
@@ -21,7 +25,7 @@ use crate::{
     helper::filter_decode,
     index::IndexEntry,
 };
-
+use std::sync::atomic::Ordering::Relaxed;
 use zstd::bulk::Decompressor;
 
 struct BlockDecoder {
@@ -155,22 +159,41 @@ impl<'a> BlockReader<'a> {
         Ok(())
     }
 
+    #[inline]
+    fn key_at(&self, offset: usize) -> Result<&'a [u8], StryxError> {
+        let header = self
+            .buf
+            .get(offset..offset + 2)
+            .ok_or(DecodeError::Truncated)?;
+        let key_len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let key_start = offset + 6;
+        self.buf
+            .get(key_start..key_start + key_len)
+            .ok_or_else(|| DecodeError::Truncated.into())
+    }
+
     // binary search the key
     fn get(&self, key: &[u8]) -> Result<Option<(&'a [u8], u32)>, StryxError> {
         let (mut lo, mut hi) = (0usize, self.record_count);
+
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let offset = self.offset(mid);
-            let (k, _) = self.record_at(offset)?;
+
+            // ONLY parse the key, don't waste time checking value lengths/bounds
+            let k = self.key_at(offset)?;
+
             if k < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
+
         if lo == self.record_count {
             return Ok(None);
         }
+
         let off = self.offset(lo);
         let (k, v) = self.record_at(off)?;
         Ok((k == key).then_some((v, off as u32)))
@@ -186,18 +209,38 @@ impl<'a> BlockReader<'a> {
     }
 }
 
+/// The thread-safe core containing the file, index, and atomic stats.
 #[derive(Debug)]
-pub struct TableReader {
-    file: File,
+pub(crate) struct SharedTable {
+    file: std::fs::File,
     index: Vec<IndexEntry>,
     metadata: TableMetadata,
-    readstats: ReadStats,
-    filter: XorFilter,
-    block_buf: Vec<u8>,
-    crc_verification: Vec<bool>,
     disable_block_verification: bool,
+    crc_verification: Vec<AtomicBool>,
+    filter: XorFilter,
+}
+
+#[derive(Debug)]
+pub struct TableReader {
+    pub readstats: ReadStats,
+    shared: Arc<SharedTable>,
+    block_buf: Vec<u8>,
     block_decoder: BlockDecoder,
     order: Vec<usize>,
+}
+
+/// Cloning the reader creates a new scratchpad for a new thread,
+/// but shares the heavy underlying index and file descriptors!
+impl Clone for TableReader {
+    fn clone(&self) -> Self {
+        Self {
+            readstats: ReadStats::default(),
+            shared: Arc::clone(&self.shared),
+            block_buf: Vec::with_capacity(BLOCK_SIZE),
+            block_decoder: BlockDecoder::new(self.shared.metadata.compression).unwrap(),
+            order: Vec::new(),
+        }
+    }
 }
 
 impl TableReader {
@@ -346,22 +389,29 @@ impl TableReader {
             return Err(DecodeError::InvalidLength.into());
         }
 
-        let crc_verification = vec![false; index_entries.len()];
+        let crc_verification: Vec<AtomicBool> = (0..index_entries.len())
+            .map(|_| AtomicBool::new(false))
+            .collect();
+
         let block_decoder = match metadata.compression {
             Compression::Zstd => BlockDecoder::new(Compression::Zstd)?,
             Compression::Lz4 => BlockDecoder::new(Compression::Lz4)?,
             Compression::None => BlockDecoder::new(Compression::None)?,
         };
 
-        Ok(TableReader {
+        let share_table = Arc::new(SharedTable {
             file,
             index: index_entries,
             metadata,
-            readstats: ReadStats::default(),
-            filter,
-            block_buf: Vec::new(),
-            crc_verification,
             disable_block_verification,
+            crc_verification,
+            filter,
+        });
+
+        Ok(TableReader {
+            readstats: ReadStats::default(),
+            shared: share_table,
+            block_buf: Vec::new(),
             block_decoder,
             order: Vec::new(),
         })
@@ -370,7 +420,7 @@ impl TableReader {
     fn xorf_contains(&self, key: &[u8]) -> bool {
         let key_hash = xxhash_rust::xxh3::xxh3_64_with_seed(key, KEY_HASH_SEED);
 
-        match &self.filter {
+        match &self.shared.filter {
             XorFilter::BinaryFuse8(bf) => bf.contains(&key_hash),
             XorFilter::BinaryFuse16(bf) => bf.contains(&key_hash),
             XorFilter::BinaryFuse32(bf) => bf.contains(&key_hash),
@@ -390,6 +440,7 @@ impl TableReader {
         // find the first index entry whose first_key is greater than requested
         // key.
         let block = self
+            .shared
             .index
             .partition_point(|entry| entry.first_key.as_slice() <= key);
 
@@ -401,20 +452,26 @@ impl TableReader {
         // since returned block's first_key is greater than the requested key,
         // the requested key `could be` in previous one
         let (offset, size, uncompressed_size) = {
-            let entry = &self.index[block - 1];
+            let entry = &self.shared.index[block - 1];
             (entry.offset, entry.size, entry.uncompressed_block_size)
         };
 
-        self.block_buf.resize(size as usize, 0);
-        self.file.read_exact_at(&mut self.block_buf, offset)?;
+        self.block_buf.reserve(size as usize);
+        unsafe {
+            self.block_buf.set_len(size as usize);
+        }
+
+        self.shared
+            .file
+            .read_exact_at(&mut self.block_buf, offset)?;
 
         self.readstats.blocks_read += 1;
         self.readstats.bytes_read += u64::from(size);
 
-        let (block_buf, decompressed) = if self.metadata.compression == Compression::Zstd {
+        let (block_buf, decompressed) = if self.shared.metadata.compression == Compression::Zstd {
             self.block_decoder
                 .zstd(&self.block_buf, uncompressed_size as usize)?
-        } else if self.metadata.compression == Compression::Lz4 {
+        } else if self.shared.metadata.compression == Compression::Lz4 {
             self.block_decoder
                 .lz4(&self.block_buf, uncompressed_size as usize)?
         } else {
@@ -428,14 +485,16 @@ impl TableReader {
 
         let idx = block - 1;
 
-        if !self.disable_block_verification && !self.crc_verification[idx] {
+        if !self.shared.disable_block_verification
+            && !self.shared.crc_verification[idx].load(std::sync::atomic::Ordering::Relaxed)
+        {
             if let Err(e) = BlockReader::verify_checksum(&block_buf) {
                 if matches!(e, StryxError::InvalidChecksum) {
                     self.readstats.checksum_failures += 1;
                 }
                 return Err(e);
             }
-            self.crc_verification[idx] = true;
+            self.shared.crc_verification[idx].store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         let reader = match BlockReader::new(&block_buf) {
@@ -496,11 +555,14 @@ impl TableReader {
             // keys are sorted, so the block index never decreases
             // search only the tail of the index
             let p = search_from
-                + self.index[search_from..].partition_point(|e| e.first_key.as_slice() <= key);
+                + self.shared.index[search_from..]
+                    .partition_point(|e| e.first_key.as_slice() <= key);
             if p == 0 {
                 self.readstats.point_misses += 1;
                 continue;
             }
+
+            self.readstats.point_lookups += 1;
 
             let idx = p - 1;
             search_from = idx; // next key can't be in an earlier block
@@ -520,7 +582,9 @@ impl TableReader {
                     self.readstats.point_hits += 1;
                     results[i] = Some(v);
                 }
-                None => self.readstats.point_misses += 1,
+                None => {
+                    self.readstats.point_misses += 1;
+                }
             }
         }
 
@@ -540,6 +604,7 @@ impl TableReader {
         }
 
         let block = self
+            .shared
             .index
             .partition_point(|entry| entry.first_key.as_slice() <= start);
 
@@ -547,11 +612,11 @@ impl TableReader {
 
         // If multiple blocks share first_key == start (allowed with duplicate keys),
         // rewind to the very first block that could contain `start`.
-        while block_idx > 0 && self.index[block_idx - 1].first_key.as_slice() == start {
+        while block_idx > 0 && self.shared.index[block_idx - 1].first_key.as_slice() == start {
             block_idx -= 1;
         }
 
-        let compression = self.metadata.compression;
+        let compression = self.shared.metadata.compression;
 
         self.readstats.range_queries += 1;
 
@@ -571,7 +636,7 @@ impl TableReader {
 
     /// Iterate over keys sharing a prefix.
     pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
-        let compression = self.metadata.compression;
+        let compression = self.shared.metadata.compression;
 
         self.readstats.prefix_queries += 1;
 
@@ -591,7 +656,7 @@ impl TableReader {
 
     /// Return table metadata.
     pub fn metadata(&self) -> &TableMetadata {
-        &self.metadata
+        &self.shared.metadata
     }
 
     /// Return runtime reader statistics.
@@ -601,17 +666,19 @@ impl TableReader {
 
     fn load_block(&mut self, idx: usize) -> Result<(), StryxError> {
         let (offset, size, uncompressed_size) = {
-            let e = &self.index[idx];
+            let e = &self.shared.index[idx];
             (e.offset, e.size, e.uncompressed_block_size)
         };
 
         self.block_buf.resize(size as usize, 0);
-        self.file.read_exact_at(&mut self.block_buf, offset)?;
+        self.shared
+            .file
+            .read_exact_at(&mut self.block_buf, offset)?;
 
         self.readstats.blocks_read += 1;
         self.readstats.bytes_read += u64::from(size);
 
-        let (data, decompressed) = match self.metadata.compression {
+        let (data, decompressed) = match self.shared.metadata.compression {
             Compression::Zstd => self
                 .block_decoder
                 .zstd(&self.block_buf, uncompressed_size as usize)?,
@@ -623,24 +690,26 @@ impl TableReader {
 
         if decompressed {
             self.readstats.blocks_decompressed += 1;
-            self.readstats.bytes_decompressed += data.len() as u64;
+            self.readstats.bytes_decompressed += data.len() as u64
         }
 
-        if !self.crc_verification[idx] && !self.disable_block_verification {
+        if !self.shared.crc_verification[idx].load(std::sync::atomic::Ordering::Relaxed)
+            && !self.shared.disable_block_verification
+        {
             if let Err(e) = BlockReader::verify_checksum(data) {
                 if matches!(e, StryxError::InvalidChecksum) {
                     self.readstats.checksum_failures += 1;
                 }
                 return Err(e);
             }
-            self.crc_verification[idx] = true;
+            self.shared.crc_verification[idx].store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(())
     }
 
     fn loaded_block(&self) -> &[u8] {
-        match self.metadata.compression {
+        match self.shared.metadata.compression {
             Compression::None => &self.block_buf,
             Compression::Zstd | Compression::Lz4 => self.block_decoder.out(),
         }
@@ -778,7 +847,7 @@ pub struct TableIterator<'a> {
 
 impl<'a> TableIterator<'a> {
     fn new(reader: &'a mut TableReader) -> Self {
-        let compression = reader.metadata.compression;
+        let compression = reader.shared.metadata.compression;
 
         Self {
             reader,
@@ -836,13 +905,13 @@ impl Iterator for TableIterator<'_> {
                 return None;
             }
 
-            if self.block_idx >= self.reader.index.len() {
+            if self.block_idx >= self.reader.shared.index.len() {
                 self.finished = true;
                 return None;
             }
 
             let (offset, size, uncompressed_block_size) = {
-                let entry = &self.reader.index[self.block_idx];
+                let entry = &self.reader.shared.index[self.block_idx];
                 (entry.offset, entry.size, entry.uncompressed_block_size)
             };
 
@@ -851,6 +920,7 @@ impl Iterator for TableIterator<'_> {
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
                 self.reader.block_buf.resize(size as usize, 0);
                 self.reader
+                    .shared
                     .file
                     .read_exact_at(&mut self.reader.block_buf, offset)?;
 
@@ -858,11 +928,11 @@ impl Iterator for TableIterator<'_> {
                 self.reader.readstats.bytes_read += u64::from(size);
 
                 let (block_buf, decompressed) =
-                    if self.reader.metadata.compression == Compression::Zstd {
+                    if self.reader.shared.metadata.compression == Compression::Zstd {
                         self.reader
                             .block_decoder
                             .zstd(&self.reader.block_buf, uncompressed_block_size as usize)?
-                    } else if self.reader.metadata.compression == Compression::Lz4 {
+                    } else if self.reader.shared.metadata.compression == Compression::Lz4 {
                         self.reader
                             .block_decoder
                             .lz4(&self.reader.block_buf, uncompressed_block_size as usize)?

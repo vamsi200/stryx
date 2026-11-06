@@ -43,32 +43,52 @@ fn main() -> anyhow::Result<()> {
         .map(|(key, value)| Record { key, value })
         .collect();
 
-    println!("starting..");
+    println!("Building table...");
 
-    let key = records[99].key;
+    let target_key = records[99].key.to_vec();
 
     table.add_batch(records);
-    let (_, stats) = table.finalize()?;
+    let (_, _stats) = table.finalize()?;
 
-    let mut reader = TableReader::open_with_options("lz4.stryx", true)?;
+    let reader = TableReader::open_with_options("lz4.stryx", true)?;
 
-    // let key = [
-    //     92, 30, 23, 10, 23, 34, 42, 24, 5, 52, 34, 29, 32, 13, 43, 5, 4,
-    // ];
+    let total_iterations = 10_000;
+    let num_threads = 4;
+    let iterations_per_thread = total_iterations / num_threads;
 
-    let iterations = 10_000;
+    println!(
+        "Starting {} lookups across {} threads...",
+        total_iterations, num_threads
+    );
 
     let start = Instant::now();
+    let mut handles = vec![];
 
-    for _ in 0..iterations {
-        let result = reader.get(std::hint::black_box(key))?;
-        std::hint::black_box(result);
+    for _ in 0..num_threads {
+        let mut thread_reader = reader.clone();
+
+        let thread_key = target_key.clone();
+
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..iterations_per_thread {
+                // We use &thread_key to pass it as a slice &[u8]
+                let result = thread_reader
+                    .get(std::hint::black_box(&thread_key))
+                    .unwrap();
+                std::hint::black_box(result);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
     }
 
     let elapsed = start.elapsed();
 
-    println!("Total: {:?}", elapsed);
-    println!("Average: {:?}", elapsed / iterations);
+    println!("Total Time: {:?}", elapsed);
+
+    println!("Average latency: {:?}", elapsed / total_iterations);
 
     Ok(())
 }

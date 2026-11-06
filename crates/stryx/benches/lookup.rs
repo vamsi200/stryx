@@ -74,7 +74,7 @@ fn bench_get(c: &mut Criterion) {
         group.throughput(Throughput::Elements(keys.len() as u64));
         group.bench_with_input(BenchmarkId::new("hit", name), &keys, |b, keys| {
             b.iter_batched_ref(
-                || TableReader::open(&fx.path).unwrap(),
+                || TableReader::open_with_options(&fx.path, true).unwrap(),
                 |reader| {
                     for k in keys {
                         black_box(reader.get(black_box(k)).unwrap());
@@ -103,7 +103,7 @@ fn bench_misses_no_compression(c: &mut Criterion) {
     group.throughput(Throughput::Elements(misses.len() as u64));
     group.bench_function("miss/table_bf8", |b| {
         b.iter_batched_ref(
-            || TableReader::open(&table_bf8.path).unwrap(),
+            || TableReader::open_with_options(&table_bf8.path, true).unwrap(),
             |reader| {
                 for k in &misses {
                     black_box(reader.get(black_box(k)).unwrap());
@@ -116,7 +116,7 @@ fn bench_misses_no_compression(c: &mut Criterion) {
     group.throughput(Throughput::Elements(misses.len() as u64));
     group.bench_function("miss/table_bf16", |b| {
         b.iter_batched_ref(
-            || TableReader::open(&table_bf16.path).unwrap(),
+            || TableReader::open_with_options(&table_bf16.path, true).unwrap(),
             |reader| {
                 for k in &misses {
                     black_box(reader.get(black_box(k)).unwrap());
@@ -129,7 +129,7 @@ fn bench_misses_no_compression(c: &mut Criterion) {
     group.throughput(Throughput::Elements(misses.len() as u64));
     group.bench_function("miss/table_bf32", |b| {
         b.iter_batched_ref(
-            || TableReader::open(&table_bf32.path).unwrap(),
+            || TableReader::open_with_options(&table_bf32.path, true).unwrap(),
             |reader| {
                 for k in &misses {
                     black_box(reader.get(black_box(k)).unwrap());
@@ -142,7 +142,7 @@ fn bench_misses_no_compression(c: &mut Criterion) {
     group.throughput(Throughput::Elements(misses.len() as u64));
     group.bench_function("miss/table_none", |b| {
         b.iter_batched_ref(
-            || TableReader::open(&table_bf_none.path).unwrap(),
+            || TableReader::open_with_options(&table_bf_none.path, true).unwrap(),
             |reader| {
                 for k in &misses {
                     black_box(reader.get(black_box(k)).unwrap());
@@ -167,7 +167,7 @@ fn bench_get_many(c: &mut Criterion) {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_with_input(BenchmarkId::new("hit", batch), &key_refs, |b, ks| {
             b.iter_batched_ref(
-                || TableReader::open(&fx.path).unwrap(),
+                || TableReader::open_with_options(&fx.path, true).unwrap(),
                 |reader| {
                     black_box(reader.get_many(black_box(ks)).unwrap());
                 },
@@ -191,7 +191,7 @@ fn bench_get_many(c: &mut Criterion) {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_with_input(BenchmarkId::new("mixed", batch), &key_refs, |b, ks| {
             b.iter_batched_ref(
-                || TableReader::open(&fx.path).unwrap(),
+                || TableReader::open_with_options(&fx.path, true).unwrap(),
                 |reader| {
                     black_box(reader.get_many(black_box(ks)).unwrap());
                 },
@@ -219,7 +219,7 @@ fn bench_get_by_options(c: &mut Criterion) {
                 &keys,
                 |b, keys| {
                     b.iter_batched_ref(
-                        || TableReader::open(&fx.path).unwrap(),
+                        || TableReader::open_with_options(&fx.path, true).unwrap(),
                         |reader| {
                             for k in keys {
                                 black_box(reader.get(black_box(k)).unwrap());

@@ -537,7 +537,7 @@ impl std::fmt::Display for WriteStatistics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TableMetadata {
     /// Total number of records stored in the table.
     pub record_count: u64,

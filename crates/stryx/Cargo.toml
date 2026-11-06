@@ -18,3 +18,7 @@ lz4_flex = "0.14.0"
 [[bench]]
 name = "lookup"
 harness = false
+
+[[bench]]
+name = "multithreaded_lookup"
+harness = false
