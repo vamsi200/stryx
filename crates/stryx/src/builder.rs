@@ -325,19 +325,12 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         let block = self.block.finish()?;
 
+        let uncompressed_block_size = u32::try_from(block.len())?;
+
         let encoded_block = match self.options.compression {
             Compression::None => block,
             Compression::Zstd => zstd::encode_all(block.as_slice(), 1)?,
-            Compression::Lz4 => {
-                let mut encoder = lz4::EncoderBuilder::new().level(4).build(Vec::new())?;
-
-                encoder.write_all(&block)?;
-
-                let (output, result) = encoder.finish();
-                result?;
-
-                output
-            }
+            Compression::Lz4 => lz4_flex::compress(&block),
         };
 
         let block_offset = self.offset;
@@ -349,6 +342,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
             self.block_first_key.as_deref().unwrap(),
             block_offset,
             block_size,
+            uncompressed_block_size,
         );
 
         self.offset += encoded_block.len() as u64;

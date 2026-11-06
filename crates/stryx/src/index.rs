@@ -17,11 +17,12 @@ impl IndexBuilder {
         }
     }
 
-    pub fn add(&mut self, first_key: &[u8], offset: u64, size: u32) {
+    pub fn add(&mut self, first_key: &[u8], offset: u64, size: u32, uncompressed_block_size: u32) {
         self.entries.push(IndexEntry {
             first_key: first_key.to_vec(),
             offset,
             size,
+            uncompressed_block_size,
         });
     }
 
@@ -60,6 +61,9 @@ pub struct IndexEntry {
 
     /// Encoded size of the block in bytes
     pub size: u32,
+
+    /// Uncompressed block size ini bytes
+    pub uncompressed_block_size: u32,
 }
 
 impl IndexEntry {
@@ -70,6 +74,7 @@ impl IndexEntry {
         dst.extend_from_slice(&self.first_key);
         dst.extend_from_slice(&self.offset.to_le_bytes());
         dst.extend_from_slice(&self.size.to_le_bytes());
+        dst.extend_from_slice(&self.uncompressed_block_size.to_le_bytes());
 
         Ok(())
     }
@@ -77,24 +82,15 @@ impl IndexEntry {
     pub fn decode<'a>(decoder: &mut Decoder<'a>) -> Result<Self, StryxError> {
         let key_len = decoder.read_u16()?;
         let first_key = decoder.read_bytes(key_len as usize)?;
-        let block_offset = u64::from_le_bytes(
-            decoder
-                .read_bytes(8)?
-                .try_into()
-                .map_err(DecodeError::from)?,
-        );
-
-        let block_size = u32::from_le_bytes(
-            decoder
-                .read_bytes(4)?
-                .try_into()
-                .map_err(DecodeError::from)?,
-        );
+        let block_offset = decoder.read_u64()?;
+        let block_size = decoder.read_u32()?;
+        let uncompressed_block_size = decoder.read_u32()?;
 
         Ok(Self {
             first_key: first_key.to_vec(),
             offset: block_offset,
             size: block_size,
+            uncompressed_block_size,
         })
     }
 }
@@ -109,6 +105,7 @@ mod tests {
             first_key: b"apple".to_vec(),
             offset: 1024,
             size: 4096,
+            uncompressed_block_size: 8096,
         };
 
         let mut encoded = Vec::new();
@@ -131,6 +128,7 @@ mod tests {
             first_key: vec![],
             offset: 0,
             size: 0,
+            uncompressed_block_size: 0,
         };
 
         let mut encoded = Vec::new();
@@ -152,6 +150,7 @@ mod tests {
             first_key: vec![b'v'; u16::MAX as usize],
             offset: u64::MAX,
             size: u32::MAX,
+            uncompressed_block_size: u32::MAX,
         };
 
         let mut encoded = Vec::new();
@@ -173,6 +172,7 @@ mod tests {
             first_key: vec![b'a'; u16::MAX as usize + 1],
             offset: 0,
             size: 0,
+            uncompressed_block_size: 0,
         };
 
         let mut encoded = Vec::new();

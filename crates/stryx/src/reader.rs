@@ -1,4 +1,7 @@
+#![allow(unused)]
+
 use std::{
+    fmt::Debug,
     fs::File,
     io::{Read, Seek},
     os::unix::fs::FileExt,
@@ -6,10 +9,11 @@ use std::{
     vec,
 };
 
+use anyhow::Result;
 use xorf::Filter;
 
 use crate::{
-    FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
+    BLOCK_SIZE, FOOTER_SIZE, KEY_HASH_SEED, MAGIC, UNITS, VERSION,
     builder::{FilterTypeRepr, Record, TableMetadata, XorFilter, from_filter_type},
     config::Compression,
     decoder::Decoder,
@@ -17,6 +21,57 @@ use crate::{
     helper::filter_decode,
     index::IndexEntry,
 };
+
+use zstd::bulk::Decompressor;
+
+struct BlockDecoder {
+    zstd: Option<Decompressor<'static>>,
+    out: Vec<u8>,
+}
+
+impl Debug for BlockDecoder {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl BlockDecoder {
+    fn new(compression: Compression) -> std::io::Result<Self> {
+        Ok(Self {
+            zstd: matches!(compression, Compression::Zstd)
+                .then(Decompressor::new)
+                .transpose()?,
+            out: Vec::new(),
+        })
+    }
+
+    fn zstd(&mut self, src: &[u8], max_len: usize) -> Result<(&[u8], bool), StryxError> {
+        self.out.clear();
+        self.out.reserve(max_len);
+        let n = self
+            .zstd
+            .as_mut()
+            .unwrap()
+            .decompress_to_buffer(src, &mut self.out)?;
+        debug_assert_eq!(n, self.out.len());
+        Ok((&self.out, true))
+    }
+
+    fn lz4(&mut self, src: &[u8], uncompressed_len: usize) -> Result<(&[u8], bool), StryxError> {
+        self.out.clear();
+        self.out.resize(uncompressed_len, 0);
+        let n = lz4_flex::block::decompress_into(src, &mut self.out)
+            .map_err(|_| DecodeError::InvalidLength)?;
+        if n != uncompressed_len {
+            return Err(DecodeError::InvalidLength.into());
+        }
+        Ok((&self.out, true))
+    }
+
+    fn out(&self) -> &[u8] {
+        &self.out
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -140,11 +195,22 @@ pub struct TableReader {
     filter: XorFilter,
     block_buf: Vec<u8>,
     crc_verification: Vec<bool>,
+    disable_block_verification: bool,
+    block_decoder: BlockDecoder,
+    order: Vec<usize>,
 }
 
 impl TableReader {
     /// Open and validate an SSTable
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StryxError> {
+        Self::open_with_options(path, false)
+    }
+
+    /// Open with options and validate an SSTable
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        disable_block_verification: bool,
+    ) -> Result<Self, StryxError> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -281,6 +347,11 @@ impl TableReader {
         }
 
         let crc_verification = vec![false; index_entries.len()];
+        let block_decoder = match metadata.compression {
+            Compression::Zstd => BlockDecoder::new(Compression::Zstd)?,
+            Compression::Lz4 => BlockDecoder::new(Compression::Lz4)?,
+            Compression::None => BlockDecoder::new(Compression::None)?,
+        };
 
         Ok(TableReader {
             file,
@@ -290,6 +361,9 @@ impl TableReader {
             filter,
             block_buf: Vec::new(),
             crc_verification,
+            disable_block_verification,
+            block_decoder,
+            order: Vec::new(),
         })
     }
 
@@ -326,9 +400,9 @@ impl TableReader {
 
         // since returned block's first_key is greater than the requested key,
         // the requested key `could be` in previous one
-        let (offset, size) = {
+        let (offset, size, uncompressed_size) = {
             let entry = &self.index[block - 1];
-            (entry.offset, entry.size)
+            (entry.offset, entry.size, entry.uncompressed_block_size)
         };
 
         self.block_buf.resize(size as usize, 0);
@@ -337,8 +411,15 @@ impl TableReader {
         self.readstats.blocks_read += 1;
         self.readstats.bytes_read += u64::from(size);
 
-        let (block_buf, decompressed) =
-            decompress_block(self.metadata.compression, &self.block_buf)?;
+        let (block_buf, decompressed) = if self.metadata.compression == Compression::Zstd {
+            self.block_decoder
+                .zstd(&self.block_buf, uncompressed_size as usize)?
+        } else if self.metadata.compression == Compression::Lz4 {
+            self.block_decoder
+                .lz4(&self.block_buf, uncompressed_size as usize)?
+        } else {
+            (self.block_buf.as_slice(), false)
+        };
 
         if decompressed {
             self.readstats.blocks_decompressed += 1;
@@ -347,7 +428,7 @@ impl TableReader {
 
         let idx = block - 1;
 
-        if !self.crc_verification[idx] {
+        if !self.disable_block_verification && !self.crc_verification[idx] {
             if let Err(e) = BlockReader::verify_checksum(&block_buf) {
                 if matches!(e, StryxError::InvalidChecksum) {
                     self.readstats.checksum_failures += 1;
@@ -389,13 +470,61 @@ impl TableReader {
 
     /// Batch point lookups.
     pub fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StryxError> {
-        let mut out = Vec::with_capacity(keys.len());
-
-        for key in keys {
-            out.push(self.get(key)?);
+        if keys.len() == 1 {
+            return Ok(vec![self.get(keys[0])?]);
         }
 
-        Ok(out)
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+
+        self.order.clear();
+        self.order.extend(0..keys.len());
+        if !keys.windows(2).all(|w| w[0] <= w[1]) {
+            self.order.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
+        }
+
+        let mut cur_block: Option<usize> = None;
+        let mut search_from = 0;
+
+        for i in 0..self.order.len() {
+            let key = keys[i];
+
+            if !self.xorf_contains(key) {
+                self.readstats.point_misses += 1;
+                continue;
+            }
+
+            // keys are sorted, so the block index never decreases
+            // search only the tail of the index
+            let p = search_from
+                + self.index[search_from..].partition_point(|e| e.first_key.as_slice() <= key);
+            if p == 0 {
+                self.readstats.point_misses += 1;
+                continue;
+            }
+
+            let idx = p - 1;
+            search_from = idx; // next key can't be in an earlier block
+
+            if cur_block != Some(idx) {
+                self.load_block(idx)?;
+                cur_block = Some(idx);
+            }
+
+            let found: Option<Vec<u8>> = {
+                let reader = BlockReader::new(self.loaded_block())?;
+                reader.get(key)?.map(|(v, _)| v.to_vec())
+            };
+
+            match found {
+                Some(v) => {
+                    self.readstats.point_hits += 1;
+                    results[i] = Some(v);
+                }
+                None => self.readstats.point_misses += 1,
+            }
+        }
+
+        Ok(results)
     }
 
     /// Iterate over all records in sorted order.
@@ -469,27 +598,51 @@ impl TableReader {
     pub fn stats(&self) -> ReadStats {
         self.readstats
     }
-}
 
-/// Decompress a data block.
-/// Returns the decoded bytes and whether decompression was performed.
-fn decompress_block(
-    compression: Compression,
-    block_buf: &[u8],
-) -> Result<(Vec<u8>, bool), StryxError> {
-    match compression {
-        Compression::None => Ok((block_buf.to_vec(), false)),
-        Compression::Zstd => Ok((zstd::decode_all(block_buf)?, true)),
-        Compression::Lz4 => {
-            let mut decoder = lz4::Decoder::new(block_buf)?;
+    fn load_block(&mut self, idx: usize) -> Result<(), StryxError> {
+        let (offset, size, uncompressed_size) = {
+            let e = &self.index[idx];
+            (e.offset, e.size, e.uncompressed_block_size)
+        };
 
-            let mut output = Vec::new();
-            decoder.read_to_end(&mut output)?;
+        self.block_buf.resize(size as usize, 0);
+        self.file.read_exact_at(&mut self.block_buf, offset)?;
 
-            let (_, result) = decoder.finish();
-            result?;
+        self.readstats.blocks_read += 1;
+        self.readstats.bytes_read += u64::from(size);
 
-            Ok((output, true))
+        let (data, decompressed) = match self.metadata.compression {
+            Compression::Zstd => self
+                .block_decoder
+                .zstd(&self.block_buf, uncompressed_size as usize)?,
+            Compression::Lz4 => self
+                .block_decoder
+                .lz4(&self.block_buf, uncompressed_size as usize)?,
+            Compression::None => (self.block_buf.as_slice(), false),
+        };
+
+        if decompressed {
+            self.readstats.blocks_decompressed += 1;
+            self.readstats.bytes_decompressed += data.len() as u64;
+        }
+
+        if !self.crc_verification[idx] && !self.disable_block_verification {
+            if let Err(e) = BlockReader::verify_checksum(data) {
+                if matches!(e, StryxError::InvalidChecksum) {
+                    self.readstats.checksum_failures += 1;
+                }
+                return Err(e);
+            }
+            self.crc_verification[idx] = true;
+        }
+
+        Ok(())
+    }
+
+    fn loaded_block(&self) -> &[u8] {
+        match self.metadata.compression {
+            Compression::None => &self.block_buf,
+            Compression::Zstd | Compression::Lz4 => self.block_decoder.out(),
         }
     }
 }
@@ -688,22 +841,34 @@ impl Iterator for TableIterator<'_> {
                 return None;
             }
 
-            let (offset, size) = {
+            let (offset, size, uncompressed_block_size) = {
                 let entry = &self.reader.index[self.block_idx];
-                (entry.offset, entry.size)
+                (entry.offset, entry.size, entry.uncompressed_block_size)
             };
 
             self.block_idx += 1;
 
-            let mut block_buf = vec![0u8; size as usize];
-
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
-                self.reader.file.read_exact_at(&mut block_buf, offset)?;
+                self.reader.block_buf.resize(size as usize, 0);
+                self.reader
+                    .file
+                    .read_exact_at(&mut self.reader.block_buf, offset)?;
 
                 self.reader.readstats.blocks_read += 1;
                 self.reader.readstats.bytes_read += u64::from(size);
 
-                let (block_buf, decompressed) = decompress_block(self.compression, &block_buf)?;
+                let (block_buf, decompressed) =
+                    if self.reader.metadata.compression == Compression::Zstd {
+                        self.reader
+                            .block_decoder
+                            .zstd(&self.reader.block_buf, uncompressed_block_size as usize)?
+                    } else if self.reader.metadata.compression == Compression::Lz4 {
+                        self.reader
+                            .block_decoder
+                            .lz4(&self.reader.block_buf, uncompressed_block_size as usize)?
+                    } else {
+                        (self.reader.block_buf.as_slice(), false)
+                    };
 
                 if decompressed {
                     self.reader.readstats.blocks_decompressed += 1;

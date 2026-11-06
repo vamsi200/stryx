@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     table.add_batch(records);
     let (_, stats) = table.finalize()?;
 
-    let mut reader = TableReader::open("lz4.stryx")?;
+    let mut reader = TableReader::open_with_options("lz4.stryx", true)?;
 
     // let key = [
     //     92, 30, 23, 10, 23, 34, 42, 24, 5, 52, 34, 29, 32, 13, 43, 5, 4,
