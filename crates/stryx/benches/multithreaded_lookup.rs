@@ -1,12 +1,14 @@
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use stryx::builder::TableBuilder;
 use stryx::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
-use stryx::reader::TableReader;
+use stryx::reader::{ReaderOptions, TableReader};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -63,6 +65,61 @@ fn sample_keys(fx: &Table, n: usize) -> Vec<Vec<u8>> {
     fx.keys.iter().step_by(step).take(n).cloned().collect()
 }
 
+/// Consecutive keys, so a batch shares blocks (the case `get_many` is built for).
+fn clustered_keys(fx: &Table, n: usize) -> Vec<Vec<u8>> {
+    let start = fx.keys.len() / 2;
+    fx.keys.iter().skip(start).take(n).cloned().collect()
+}
+
+fn run_threads<T, F>(
+    base: &TableReader,
+    items: &[T],
+    threads: usize,
+    iters: u64,
+    work: F,
+) -> Duration
+where
+    T: Sync,
+    F: Fn(&mut TableReader, &[T]) + Sync,
+{
+    let chunk_size = items.len().div_ceil(threads).max(1);
+    let chunks: Vec<&[T]> = items.chunks(chunk_size).collect();
+    let n = chunks.len();
+
+    let readers: Vec<TableReader> = (0..n).map(|_| base.clone()).collect();
+    let barrier = Barrier::new(n + 1);
+
+    thread::scope(|s| {
+        for (mut reader, chunk) in readers.into_iter().zip(chunks) {
+            let barrier = &barrier;
+            let work = &work;
+            s.spawn(move || {
+                work(&mut reader, chunk); // untimed warm-up pass
+                barrier.wait(); // start together
+                for _ in 0..iters {
+                    work(&mut reader, chunk);
+                }
+                barrier.wait(); // all finished
+            });
+        }
+
+        barrier.wait();
+        let start = Instant::now();
+        barrier.wait();
+        start.elapsed()
+    })
+}
+
+fn get_each(reader: &mut TableReader, keys: &[Vec<u8>]) {
+    for k in keys {
+        black_box(reader.get(black_box(k)).unwrap());
+    }
+}
+
+fn get_many_chunk(reader: &mut TableReader, keys: &[&[u8]]) {
+    black_box(reader.get_many(black_box(keys)).unwrap());
+}
+
 fn bench_get(c: &mut Criterion) {
     let mut group = c.benchmark_group("mt_get");
 
@@ -74,28 +131,29 @@ fn bench_get(c: &mut Criterion) {
     ] {
         let fx = build_table(100_000, Compression::None, filter, 4096);
         let keys = sample_keys(&fx, 1024);
+        let base = TableReader::open_with_options(&fx.path, ReaderOptions::default()).unwrap();
 
         group.throughput(Throughput::Elements(keys.len() as u64));
-        group.bench_with_input(BenchmarkId::new("hit", name), &keys, |b, keys| {
-            b.iter_batched_ref(
-                || TableReader::open_with_options(&fx.path, true).unwrap(),
-                |reader| {
-                    let chunk_size = (keys.len() + NUM_THREADS - 1) / NUM_THREADS;
-                    let chunk_size = chunk_size.max(1);
+        group.bench_function(BenchmarkId::new("hit", name), |b| {
+            b.iter_custom(|iters| run_threads(&base, &keys, NUM_THREADS, iters, get_each));
+        });
+    }
 
-                    thread::scope(|s| {
-                        for chunk in keys.chunks(chunk_size) {
-                            let mut thread_reader = reader.clone();
-                            s.spawn(move || {
-                                for k in chunk {
-                                    black_box(thread_reader.get(black_box(k)).unwrap());
-                                }
-                            });
-                        }
-                    });
-                },
-                BatchSize::SmallInput,
-            );
+    group.finish();
+}
+
+/// Same workload at 1, 2 and 4 threads: the scaling curve in one place.
+fn bench_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mt_scaling");
+
+    let fx = build_table(100_000, Compression::None, FilterType::None, 4096);
+    let keys = sample_keys(&fx, 1024);
+    let base = TableReader::open_with_options(&fx.path, ReaderOptions::default()).unwrap();
+
+    group.throughput(Throughput::Elements(keys.len() as u64));
+    for threads in [1usize, 2, 4] {
+        group.bench_function(BenchmarkId::new("hit/no_filter", threads), |b| {
+            b.iter_custom(|iters| run_threads(&base, &keys, threads, iters, get_each));
         });
     }
 
@@ -105,56 +163,26 @@ fn bench_get(c: &mut Criterion) {
 fn bench_misses_no_compression(c: &mut Criterion) {
     let mut group = c.benchmark_group("mt_get_miss");
 
-    let table_bf8 = build_table(100_000, Compression::None, FilterType::BinaryFuse8, 4096);
-    let table_bf16 = build_table(100_000, Compression::None, FilterType::BinaryFuse16, 4096);
-    let table_bf32 = build_table(100_000, Compression::None, FilterType::BinaryFuse32, 4096);
-    let table_bf_none = build_table(100_000, Compression::None, FilterType::None, 4096);
+    let tables = [
+        ("table_bf8", FilterType::BinaryFuse8),
+        ("table_bf16", FilterType::BinaryFuse16),
+        ("table_bf32", FilterType::BinaryFuse32),
+        ("table_none", FilterType::None),
+    ];
 
     let misses: Vec<Vec<u8>> = (0..1024)
         .map(|i| format!("absent-{i:010}-").into_bytes())
         .collect();
 
-    let run_misses = |b: &mut criterion::Bencher, path: &PathBuf, keys: &Vec<Vec<u8>>| {
-        b.iter_batched_ref(
-            || TableReader::open_with_options(path, true).unwrap(),
-            |reader| {
-                let chunk_size = (keys.len() + NUM_THREADS - 1) / NUM_THREADS;
-                let chunk_size = chunk_size.max(1);
-
-                thread::scope(|s| {
-                    for chunk in keys.chunks(chunk_size) {
-                        let mut thread_reader = reader.clone();
-                        s.spawn(move || {
-                            for k in chunk {
-                                black_box(thread_reader.get(black_box(k)).unwrap());
-                            }
-                        });
-                    }
-                });
-            },
-            BatchSize::SmallInput,
-        );
-    };
-
     group.throughput(Throughput::Elements(misses.len() as u64));
-    group.bench_function("miss/table_bf8", |b| {
-        run_misses(b, &table_bf8.path, &misses)
-    });
+    for (name, filter) in tables {
+        let fx = build_table(100_000, Compression::None, filter, 4096);
+        let base = TableReader::open_with_options(&fx.path, ReaderOptions::default()).unwrap();
 
-    group.throughput(Throughput::Elements(misses.len() as u64));
-    group.bench_function("miss/table_bf16", |b| {
-        run_misses(b, &table_bf16.path, &misses)
-    });
-
-    group.throughput(Throughput::Elements(misses.len() as u64));
-    group.bench_function("miss/table_bf32", |b| {
-        run_misses(b, &table_bf32.path, &misses)
-    });
-
-    group.throughput(Throughput::Elements(misses.len() as u64));
-    group.bench_function("miss/table_none", |b| {
-        run_misses(b, &table_bf_none.path, &misses)
-    });
+        group.bench_function(BenchmarkId::new("miss", name), |b| {
+            b.iter_custom(|iters| run_threads(&base, &misses, NUM_THREADS, iters, get_each));
+        });
+    }
 
     group.finish();
 }
@@ -163,30 +191,41 @@ fn bench_get_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("mt_get_many");
 
     let fx = build_table(100_000, Compression::None, FilterType::BinaryFuse8, 4096);
+    let base = TableReader::open_with_options(&fx.path, ReaderOptions::default()).unwrap();
 
+    // Spread keys: few keys share a block, so grouping can't help much.
     for batch in [1usize, 8, 64, 256, 1024] {
         let keys = sample_keys(&fx, batch);
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
 
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(BenchmarkId::new("hit", batch), &key_refs, |b, ks| {
-            b.iter_batched_ref(
-                || TableReader::open_with_options(&fx.path, true).unwrap(),
-                |reader| {
-                    let chunk_size = (ks.len() + NUM_THREADS - 1) / NUM_THREADS;
-                    let chunk_size = chunk_size.max(1);
+        group.bench_function(BenchmarkId::new("hit", batch), |b| {
+            b.iter_custom(|iters| {
+                run_threads(&base, &key_refs, NUM_THREADS, iters, get_many_chunk)
+            });
+        });
+    }
 
-                    thread::scope(|s| {
-                        for chunk in ks.chunks(chunk_size) {
-                            let mut thread_reader = reader.clone();
-                            s.spawn(move || {
-                                black_box(thread_reader.get_many(black_box(chunk)).unwrap());
-                            });
-                        }
-                    });
-                },
-                BatchSize::SmallInput,
-            );
+    // Adjacent keys: many keys per block. This is where get_many should win.
+    for batch in [64usize, 256, 1024] {
+        let keys = clustered_keys(&fx, batch);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+
+        group.throughput(Throughput::Elements(batch as u64));
+        group.bench_function(BenchmarkId::new("clustered", batch), |b| {
+            b.iter_custom(|iters| {
+                run_threads(&base, &key_refs, NUM_THREADS, iters, get_many_chunk)
+            });
+        });
+    }
+
+    // Same clustered keys through plain get, for a direct comparison.
+    for batch in [64usize, 256, 1024] {
+        let keys = clustered_keys(&fx, batch);
+
+        group.throughput(Throughput::Elements(batch as u64));
+        group.bench_function(BenchmarkId::new("clustered_get_loop", batch), |b| {
+            b.iter_custom(|iters| run_threads(&base, &keys, NUM_THREADS, iters, get_each));
         });
     }
 
@@ -203,24 +242,10 @@ fn bench_get_many(c: &mut Criterion) {
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
 
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(BenchmarkId::new("mixed", batch), &key_refs, |b, ks| {
-            b.iter_batched_ref(
-                || TableReader::open_with_options(&fx.path, true).unwrap(),
-                |reader| {
-                    let chunk_size = (ks.len() + NUM_THREADS - 1) / NUM_THREADS;
-                    let chunk_size = chunk_size.max(1);
-
-                    thread::scope(|s| {
-                        for chunk in ks.chunks(chunk_size) {
-                            let mut thread_reader = reader.clone();
-                            s.spawn(move || {
-                                black_box(thread_reader.get_many(black_box(chunk)).unwrap());
-                            });
-                        }
-                    });
-                },
-                BatchSize::SmallInput,
-            );
+        group.bench_function(BenchmarkId::new("mixed", batch), |b| {
+            b.iter_custom(|iters| {
+                run_threads(&base, &key_refs, NUM_THREADS, iters, get_many_chunk)
+            });
         });
     }
 
@@ -236,31 +261,13 @@ fn bench_get_by_options(c: &mut Criterion) {
         for block_size in [1024usize, 4096, 16_384] {
             let fx = build_table(n, compression, FilterType::BinaryFuse16, block_size);
             let keys = sample_keys(&fx, 512);
+            let base = TableReader::open_with_options(&fx.path, ReaderOptions::default()).unwrap();
 
             group.throughput(Throughput::Elements(keys.len() as u64));
-            group.bench_with_input(
+            group.bench_function(
                 BenchmarkId::new(format!("{compression:?}"), format!("bs{block_size}")),
-                &keys,
-                |b, keys| {
-                    b.iter_batched_ref(
-                        || TableReader::open_with_options(&fx.path, true).unwrap(),
-                        |reader| {
-                            let chunk_size = (keys.len() + NUM_THREADS - 1) / NUM_THREADS;
-                            let chunk_size = chunk_size.max(1);
-
-                            thread::scope(|s| {
-                                for chunk in keys.chunks(chunk_size) {
-                                    let mut thread_reader = reader.clone();
-                                    s.spawn(move || {
-                                        for k in chunk {
-                                            black_box(thread_reader.get(black_box(k)).unwrap());
-                                        }
-                                    });
-                                }
-                            });
-                        },
-                        BatchSize::SmallInput,
-                    );
+                |b| {
+                    b.iter_custom(|iters| run_threads(&base, &keys, NUM_THREADS, iters, get_each));
                 },
             );
         }
@@ -271,6 +278,7 @@ fn bench_get_by_options(c: &mut Criterion) {
 
 fn mt_benches(c: &mut Criterion) {
     bench_get(c);
+    bench_scaling(c);
     bench_get_many(c);
     bench_get_by_options(c);
     bench_misses_no_compression(c);
@@ -279,8 +287,8 @@ fn mt_benches(c: &mut Criterion) {
 criterion_group! {
     name = mt_lookup_benches;
     config = Criterion::default()
-        .sample_size(50)
-        .measurement_time(std::time::Duration::from_secs(10));
+        .sample_size(30)
+        .measurement_time(std::time::Duration::from_secs(5));
     targets = mt_benches
 }
 criterion_main!(mt_lookup_benches);
