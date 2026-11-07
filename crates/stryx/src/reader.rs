@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use bytes::Bytes;
-use moka::sync::Cache;
+use quick_cache::Weighter;
 use xorf::Filter;
 
 use crate::{
@@ -26,32 +26,41 @@ use crate::{
     decoder::Decoder,
     error::{DecodeError, StryxError},
     helper::filter_decode,
-    index::IndexEntry,
+    index::{Index, IndexEntry},
 };
 use std::sync::atomic::Ordering::Relaxed;
 use zstd::bulk::Decompressor;
 
-pub type BlockCache = Cache<u32, Arc<[u8]>>;
+#[derive(Clone)]
+struct BlockWeighter;
 
-#[derive(Debug, Clone)]
-pub struct BlockCacheOptions {
-    pub max_capacity: Option<u64>,
+impl Weighter<u32, Arc<Vec<u8>>> for BlockWeighter {
+    fn weight(&self, _idx: &u32, block: &Arc<Vec<u8>>) -> u64 {
+        block.len() as u64
+    }
 }
 
-impl BlockCacheOptions {
-    pub fn bytes(value: u64) -> Self {
-        assert!(value > 0);
+#[derive(Debug)]
+pub struct BlockCacheQuick(quick_cache::sync::Cache<u32, Arc<Vec<u8>>, BlockWeighter>);
 
-        Self {
-            max_capacity: Some(value),
-        }
+impl BlockCacheQuick {
+    pub fn new(max_bytes: u64) -> Self {
+        let est_items = ((max_bytes / 4096).max(16)) as usize;
+        Self(quick_cache::sync::Cache::with_weighter(
+            est_items,
+            max_bytes,
+            BlockWeighter,
+        ))
     }
 
-    pub fn build_cache(&self) -> BlockCache {
-        Cache::builder()
-            .max_capacity(self.max_capacity.unwrap())
-            .weigher(|_idx, block: &Arc<[u8]>| u32::try_from(block.len()).unwrap_or(u32::MAX))
-            .build()
+    #[inline]
+    pub(crate) fn get(&self, idx: &u32) -> Option<Arc<Vec<u8>>> {
+        self.0.get(idx)
+    }
+
+    #[inline]
+    pub(crate) fn insert(&self, idx: u32, block: Arc<Vec<u8>>) {
+        self.0.insert(idx, block);
     }
 }
 
@@ -239,7 +248,7 @@ impl<'a> BlockReader<'a> {
 #[derive(Debug)]
 pub struct ReaderOptions {
     pub disable_block_verification: bool,
-    pub block_cache: Option<BlockCache>,
+    pub block_cache: Option<BlockCacheQuick>,
 }
 
 impl Default for ReaderOptions {
@@ -251,16 +260,15 @@ impl Default for ReaderOptions {
     }
 }
 
-/// The thread-safe core containing the file, index, and atomic stats.
 #[derive(Debug)]
 pub(crate) struct SharedTable {
     file: std::fs::File,
-    index: Vec<IndexEntry>,
+    index: Index,
     metadata: TableMetadata,
     disable_block_verification: bool,
     crc_verification: Vec<AtomicBool>,
     filter: XorFilter,
-    block_cache: Option<BlockCache>,
+    block_cache: Option<BlockCacheQuick>,
     block_seen: Vec<AtomicBool>,
 }
 
@@ -425,28 +433,26 @@ impl TableReader {
             return Err(StryxError::InvalidChecksum);
         }
 
-        let mut index_entries = Vec::new();
-
-        for _ in 0..count {
-            index_entries.push(IndexEntry::decode(&mut decoder)?);
-        }
+        let mut index = Index::decode(&mut decoder, count as usize)?;
 
         // Reject unexpected trailing bytes in the entry region.
         if decoder.remaining() != 0 {
             return Err(DecodeError::InvalidLength.into());
         }
 
-        let crc_verification: Vec<AtomicBool> = (0..index_entries.len())
+        let crc_verification: Vec<AtomicBool> = (0..index.entries.len())
             .map(|_| AtomicBool::new(false))
             .collect();
 
         let seen: Vec<AtomicBool> = if reader_options.block_cache.is_some() {
-            (0..index_entries.len())
+            (0..index.entries.len())
                 .map(|_| AtomicBool::new(false))
                 .collect()
         } else {
             Vec::new()
         };
+
+        index.build_prefixes();
 
         let block_decoder = match metadata.compression {
             Compression::Zstd => BlockDecoder::new(Compression::Zstd)?,
@@ -456,7 +462,7 @@ impl TableReader {
 
         let share_table = Arc::new(SharedTable {
             file,
-            index: index_entries,
+            index,
             metadata,
             disable_block_verification: reader_options.disable_block_verification,
             crc_verification,
@@ -496,10 +502,7 @@ impl TableReader {
 
         // find the first index entry whose first_key is greater than requested
         // key.
-        let block = self
-            .shared
-            .index
-            .partition_point(|e| e.first_key.as_slice() <= key);
+        let block = self.shared.index.partition_point_le(key);
 
         if block == 0 {
             self.readstats.point_misses += 1;
@@ -541,7 +544,7 @@ impl TableReader {
                 // never pay for the allocation, the copy or the insert
                 if let Some(cache) = &self.shared.block_cache {
                     if self.shared.block_seen[idx].swap(true, Ordering::Relaxed) {
-                        cache.insert(idx as u32, Arc::from(self.loaded_block()));
+                        cache.insert(idx as u32, Arc::from(self.loaded_block().to_vec()));
                     }
                 }
 
@@ -583,7 +586,7 @@ impl TableReader {
         }
 
         let mut cur_block: Option<usize> = None;
-        let mut cur_arc: Option<Arc<[u8]>> = None;
+        let mut cur_arc: Option<Arc<Vec<u8>>> = None;
         let mut search_from = 0;
 
         for i in 0..self.order.len() {
@@ -598,9 +601,8 @@ impl TableReader {
             self.readstats.point_lookups += 1;
 
             // keys are sorted, so the block index never decreases
-            let p = search_from
-                + self.shared.index[search_from..]
-                    .partition_point(|e| e.first_key.as_slice() <= key);
+            let p = self.shared.index.partition_point_le_from(search_from, key);
+
             if p == 0 {
                 self.readstats.point_misses += 1;
                 continue;
@@ -625,7 +627,7 @@ impl TableReader {
                     self.load_block(idx)?;
 
                     if let Some(cache) = &self.shared.block_cache {
-                        let arc: Arc<[u8]> = Arc::from(self.loaded_block());
+                        let arc: Arc<Vec<u8>> = Arc::from(self.loaded_block().to_vec());
                         cache.insert(idx as u32, Arc::clone(&arc));
                         cur_arc = Some(arc);
                     }
@@ -673,16 +675,13 @@ impl TableReader {
             return Err(StryxError::InvalidRange);
         }
 
-        let block = self
-            .shared
-            .index
-            .partition_point(|entry| entry.first_key.as_slice() <= start);
+        let block = self.shared.index.partition_point_le(start);
 
         let mut block_idx = block.saturating_sub(1);
 
         // If multiple blocks share first_key == start (allowed with duplicate keys),
         // rewind to the very first block that could contain `start`.
-        while block_idx > 0 && self.shared.index[block_idx - 1].first_key.as_slice() == start {
+        while block_idx > 0 && self.shared.index.first_key(block_idx - 1) == start {
             block_idx -= 1;
         }
 
@@ -743,7 +742,7 @@ impl TableReader {
         self.loaded_idx = None;
 
         let (offset, size, uncompressed_size) = {
-            let e = &self.shared.index[idx];
+            let e = &self.shared.index.entries[idx];
             (e.offset, e.size, e.uncompressed_block_size)
         };
 
@@ -1040,13 +1039,13 @@ impl Iterator for TableIterator<'_> {
                 return None;
             }
 
-            if self.block_idx >= self.reader.shared.index.len() {
+            if self.block_idx >= self.reader.shared.index.entries.len() {
                 self.finished = true;
                 return None;
             }
 
             let (offset, size, uncompressed_block_size) = {
-                let entry = &self.reader.shared.index[self.block_idx];
+                let entry = &self.reader.shared.index.entries[self.block_idx];
                 (entry.offset, entry.size, entry.uncompressed_block_size)
             };
 

@@ -1,5 +1,7 @@
 #![allow(unused)]
 
+use std::cmp::Ordering;
+
 use crate::{
     decoder::Decoder,
     error::{DecodeError, StryxError},
@@ -7,19 +9,35 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct IndexBuilder {
-    entries: Vec<IndexEntry>,
+    index: Index,
 }
 
 impl IndexBuilder {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            index: Index {
+                key_data: Vec::new(),
+                entries: Vec::new(),
+                key_prefixes: Vec::new(),
+                lcp_len: 0,
+            },
         }
     }
 
     pub fn add(&mut self, first_key: &[u8], offset: u64, size: u32, uncompressed_block_size: u32) {
-        self.entries.push(IndexEntry {
-            first_key: first_key.to_vec(),
+        let key_offset = self.index.key_data.len() as u32;
+        let key_len = first_key.len() as u16;
+
+        let mut prefix = [0u8; 8];
+        let copied = first_key.len().min(8);
+        prefix[..copied].copy_from_slice(&first_key[..copied]);
+
+        self.index.key_data.extend_from_slice(first_key);
+        self.index.key_prefixes.push(u64::from_be_bytes(prefix));
+
+        self.index.entries.push(IndexEntry {
+            key_offset,
+            key_len,
             offset,
             size,
             uncompressed_block_size,
@@ -29,17 +47,146 @@ impl IndexBuilder {
     pub fn finish(self) -> Result<Vec<u8>, StryxError> {
         let mut encoded = Vec::new();
 
-        for entry in &self.entries {
-            entry.encode(&mut encoded)?;
-        }
+        self.index.encode(&mut encoded)?;
 
-        let count = u32::try_from(self.entries.len())?;
+        let count = u32::try_from(self.index.entries.len())?;
         encoded.extend_from_slice(&count.to_le_bytes());
 
         let checksum = crc32c::crc32c(&encoded);
         encoded.extend_from_slice(&checksum.to_le_bytes());
 
         Ok(encoded)
+    }
+}
+
+#[derive(Debug)]
+pub struct Index {
+    /// Concatenated first keys from all index entries.
+    pub key_data: Vec<u8>,
+
+    /// Metadata for each index entry.
+    pub entries: Vec<IndexEntry>,
+
+    /// Big-endian first-eight-byte prefixes, one per entry.
+    pub key_prefixes: Vec<u64>,
+
+    /// Length of the prefix shared by every first key (first and last key bound the rest).
+    pub lcp_len: usize,
+}
+
+#[inline]
+fn prefix_be(b: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = b.len().min(8);
+    buf[..n].copy_from_slice(&b[..n]);
+    u64::from_be_bytes(buf)
+}
+
+impl Index {
+    pub fn build_prefixes(&mut self) {
+        let n = self.entries.len();
+        self.lcp_len = if n == 0 {
+            0
+        } else {
+            let (a, b) = (self.first_key(0), self.first_key(n - 1));
+            a.iter().zip(b).take_while(|(x, y)| x == y).count()
+        };
+        let l = self.lcp_len;
+        self.key_prefixes = (0..n).map(|i| prefix_be(&self.first_key(i)[l..])).collect();
+    }
+
+    pub fn encode(&self, dst: &mut Vec<u8>) -> Result<(), StryxError> {
+        for (i, entry) in self.entries.iter().enumerate() {
+            let first_key = self.first_key(i);
+            let key_len = u16::try_from(first_key.len())?;
+
+            dst.extend_from_slice(&key_len.to_le_bytes());
+            dst.extend_from_slice(first_key);
+            dst.extend_from_slice(&entry.offset.to_le_bytes());
+            dst.extend_from_slice(&entry.size.to_le_bytes());
+            dst.extend_from_slice(&entry.uncompressed_block_size.to_le_bytes());
+        }
+
+        Ok(())
+    }
+
+    pub fn decode(decoder: &mut Decoder<'_>, entry_count: usize) -> Result<Self, StryxError> {
+        let mut index = Self {
+            key_data: Vec::new(),
+            entries: Vec::with_capacity(entry_count),
+            key_prefixes: Vec::with_capacity(entry_count),
+            lcp_len: 0,
+        };
+
+        for _ in 0..entry_count {
+            let key_len = decoder.read_u16()?;
+            let first_key = decoder.read_bytes(key_len as usize)?;
+
+            let key_offset = u32::try_from(index.key_data.len())?;
+
+            let mut prefix = [0u8; 8];
+            let copied = first_key.len().min(8);
+            prefix[..copied].copy_from_slice(&first_key[..copied]);
+
+            index.key_data.extend_from_slice(first_key);
+            index.key_prefixes.push(u64::from_be_bytes(prefix));
+
+            index.entries.push(IndexEntry {
+                key_offset,
+                key_len,
+                offset: decoder.read_u64()?,
+                size: decoder.read_u32()?,
+                uncompressed_block_size: decoder.read_u32()?,
+            });
+        }
+
+        Ok(index)
+    }
+
+    pub fn first_key(&self, index: usize) -> &[u8] {
+        let entry = &self.entries[index];
+        let start = entry.key_offset as usize;
+        let end = start + entry.key_len as usize;
+        &self.key_data[start..end]
+    }
+
+    pub fn partition_point_le_from(&self, start: usize, key: &[u8]) -> usize {
+        let n = self.entries.len();
+        if start >= n {
+            return n;
+        }
+        let l = self.lcp_len;
+        let lcp = &self.first_key(0)[..l];
+        let m = key.len().min(l);
+        match key[..m].cmp(&lcp[..m]) {
+            Ordering::Less => return start, // key < every first key
+            Ordering::Greater => return n,  // key > every first key
+            Ordering::Equal if key.len() < l => return start, // proper prefix of lcp: smaller than all
+            Ordering::Equal => {}
+        }
+
+        let kp = prefix_be(&key[l..]);
+        let pre = &self.key_prefixes;
+
+        // smaller prefix => strictly smaller key; equal prefix => needs a real compare
+        let lo = start + pre[start..].partition_point(|&p| p < kp);
+        let hi = lo + pre[lo..].partition_point(|&p| p == kp);
+
+        let (mut a, mut b) = (lo, hi);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if self.first_key(mid) <= key {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        a // larger prefix => strictly larger key, so everything from `hi` on stays false
+    }
+
+    #[inline]
+    pub fn partition_point_le(&self, key: &[u8]) -> usize {
+        self.partition_point_le_from(0, key)
     }
 }
 
@@ -53,8 +200,11 @@ impl IndexBuilder {
 /// Total encoded size: `2 + key_len + 8 + 4` bytes.
 #[derive(Debug)]
 pub struct IndexEntry {
-    /// First key in the corresponding data block
-    pub first_key: Vec<u8>,
+    /// byte offset of the key
+    pub key_offset: u32,
+
+    /// Key len
+    pub key_len: u16,
 
     /// Absolute byte offset of the block in the SSTable file
     pub offset: u64,
@@ -66,119 +216,90 @@ pub struct IndexEntry {
     pub uncompressed_block_size: u32,
 }
 
-impl IndexEntry {
-    pub fn encode(&self, dst: &mut Vec<u8>) -> Result<(), StryxError> {
-        let key_len = u16::try_from(self.first_key.len())?;
-
-        dst.extend_from_slice(&key_len.to_le_bytes());
-        dst.extend_from_slice(&self.first_key);
-        dst.extend_from_slice(&self.offset.to_le_bytes());
-        dst.extend_from_slice(&self.size.to_le_bytes());
-        dst.extend_from_slice(&self.uncompressed_block_size.to_le_bytes());
-
-        Ok(())
-    }
-
-    pub fn decode<'a>(decoder: &mut Decoder<'a>) -> Result<Self, StryxError> {
-        let key_len = decoder.read_u16()?;
-        let first_key = decoder.read_bytes(key_len as usize)?;
-        let block_offset = decoder.read_u64()?;
-        let block_size = decoder.read_u32()?;
-        let uncompressed_block_size = decoder.read_u32()?;
-
-        Ok(Self {
-            first_key: first_key.to_vec(),
-            offset: block_offset,
-            size: block_size,
-            uncompressed_block_size,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_index_entry() -> Result<(), StryxError> {
-        let entry = IndexEntry {
-            first_key: b"apple".to_vec(),
-            offset: 1024,
-            size: 4096,
-            uncompressed_block_size: 8096,
-        };
+    fn test_index_roundtrip() -> Result<(), StryxError> {
+        let mut builder = IndexBuilder::new();
+        builder.add(b"apple", 1024, 4096, 8096);
+        builder.add(b"banana", 5120, 2048, 4096);
 
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded)?;
+        let encoded = builder.finish()?;
+
+        // last 4 bytes are the checksum, preceding 4 are the count
+        let body_len = encoded.len() - 4 - 4;
+        let count =
+            u32::from_le_bytes(encoded[body_len..body_len + 4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
 
         let mut decoder = Decoder::new(&encoded);
-        let decoded = IndexEntry::decode(&mut decoder)?;
+        let index = Index::decode(&mut decoder, count)?;
 
-        assert_eq!(decoded.first_key, entry.first_key);
-        assert_eq!(decoded.offset, entry.offset);
-        assert_eq!(decoded.size, entry.size);
-        assert_eq!(decoder.remaining(), 0);
+        assert_eq!(index.entries.len(), 2);
+        assert_eq!(index.first_key(0), b"apple");
+        assert_eq!(index.first_key(1), b"banana");
+        assert_eq!(index.entries[0].offset, 1024);
+        assert_eq!(index.entries[0].size, 4096);
+        assert_eq!(index.entries[0].uncompressed_block_size, 8096);
+        assert_eq!(index.entries[1].offset, 5120);
+
+        let mut expected_prefix = [0u8; 8];
+        expected_prefix[..5].copy_from_slice(b"apple");
+        assert_eq!(index.key_prefixes[0], u64::from_be_bytes(expected_prefix));
+
+        let mut expected_prefix = [0u8; 8];
+        expected_prefix[..6].copy_from_slice(b"banana");
+        assert_eq!(index.key_prefixes[1], u64::from_be_bytes(expected_prefix));
 
         Ok(())
     }
 
     #[test]
     fn test_index_entry_empty_key() -> Result<(), StryxError> {
-        let entry = IndexEntry {
-            first_key: vec![],
-            offset: 0,
-            size: 0,
-            uncompressed_block_size: 0,
-        };
+        let mut builder = IndexBuilder::new();
+        builder.add(b"", 0, 0, 0);
 
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded)?;
+        let encoded = builder.finish()?;
+
+        let body_len = encoded.len() - 4 - 4;
+        let count =
+            u32::from_le_bytes(encoded[body_len..body_len + 4].try_into().unwrap()) as usize;
 
         let mut decoder = Decoder::new(&encoded);
-        let decoded = IndexEntry::decode(&mut decoder)?;
+        let index = Index::decode(&mut decoder, count)?;
 
-        assert!(decoded.first_key.is_empty());
-        assert_eq!(decoded.offset, 0);
-        assert_eq!(decoded.size, 0);
+        assert!(index.first_key(0).is_empty());
+        assert_eq!(index.entries[0].offset, 0);
+        assert_eq!(index.entries[0].size, 0);
+        assert_eq!(index.key_prefixes[0], 0);
 
         Ok(())
     }
 
     #[test]
     fn test_index_entry_max_key_length() -> Result<(), StryxError> {
-        let entry = IndexEntry {
-            first_key: vec![b'v'; u16::MAX as usize],
-            offset: u64::MAX,
-            size: u32::MAX,
-            uncompressed_block_size: u32::MAX,
-        };
+        let long_key = vec![b'v'; u16::MAX as usize];
 
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded)?;
+        let mut builder = IndexBuilder::new();
+        builder.add(&long_key, u64::MAX, u32::MAX, u32::MAX);
+
+        let encoded = builder.finish()?;
+
+        let body_len = encoded.len() - 4 - 4;
+        let count =
+            u32::from_le_bytes(encoded[body_len..body_len + 4].try_into().unwrap()) as usize;
 
         let mut decoder = Decoder::new(&encoded);
-        let decoded = IndexEntry::decode(&mut decoder)?;
+        let index = Index::decode(&mut decoder, count)?;
 
-        assert_eq!(decoded.first_key, entry.first_key);
-        assert_eq!(decoded.offset, u64::MAX);
-        assert_eq!(decoded.size, u32::MAX);
+        assert_eq!(index.first_key(0), long_key.as_slice());
+        assert_eq!(index.entries[0].offset, u64::MAX);
+        assert_eq!(index.entries[0].size, u32::MAX);
+        assert_eq!(index.entries[0].uncompressed_block_size, u32::MAX);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_index_entry_key_too_large() {
-        let entry = IndexEntry {
-            first_key: vec![b'a'; u16::MAX as usize + 1],
-            offset: 0,
-            size: 0,
-            uncompressed_block_size: 0,
-        };
-
-        let mut encoded = Vec::new();
-
-        assert!(entry.encode(&mut encoded).is_err());
-        assert!(encoded.is_empty());
     }
 
     #[test]
@@ -186,7 +307,7 @@ mod tests {
         let bytes = [0x01];
         let mut decoder = Decoder::new(&bytes);
 
-        assert!(IndexEntry::decode(&mut decoder).is_err());
+        assert!(Index::decode(&mut decoder, 1).is_err());
     }
 
     #[test]
@@ -198,7 +319,7 @@ mod tests {
 
         let mut decoder = Decoder::new(&bytes);
 
-        assert!(IndexEntry::decode(&mut decoder).is_err());
+        assert!(Index::decode(&mut decoder, 1).is_err());
     }
 
     #[test]
@@ -210,7 +331,7 @@ mod tests {
 
         let mut decoder = Decoder::new(&bytes);
 
-        assert!(IndexEntry::decode(&mut decoder).is_err());
+        assert!(Index::decode(&mut decoder, 1).is_err());
     }
 
     #[test]
@@ -223,6 +344,6 @@ mod tests {
 
         let mut decoder = Decoder::new(&bytes);
 
-        assert!(IndexEntry::decode(&mut decoder).is_err());
+        assert!(Index::decode(&mut decoder, 1).is_err());
     }
 }

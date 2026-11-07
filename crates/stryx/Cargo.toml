@@ -14,8 +14,8 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 xorf = { version = "0.13.0", features = ["serde"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 lz4_flex = "0.14.0"
-moka = { version = "0.12.16", features = ["sync"] }
 bytes = "1.12.1"
+quick_cache = "0.7.0"
 
 [[bench]]
 name = "lookup"
