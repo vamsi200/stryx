@@ -1,1 +1,181 @@
-working on it...
+# stryx
+
+An immutable, sorted key-value table format and reader/writer library in Rust, in the spirit of an SSTable.
+You write a set of key-value pairs once, and then read it back with fast point lookups, batch lookups and ordered scans.
+
+## Details
+- **One file, read-only after writing.** Records are sorted by key and grouped into blocks.
+- **Sparse index.** One entry per block, so memory use stays small even for large tables.
+- **Optional membership filter** (Binary Fuse 8/16/32). Lookups for keys that aren't in the table return in tens of nanoseconds.
+- **Optional block compression:** LZ4 or Zstd.
+- **Integrity checks.** CRC32C on every block, the index and the filter.
+- **Thread-friendly reads.** The heavy state (file, index, filter) is shared behind an `Arc`, and each thread gets its own cheap reader clone.
+- **Optional decoded-block cache,** off by default.
+
+> **Status:** early development. The on-disk format is versioned but not yet stable, so files written by one version may not be readable by the next.
+
+## Quick start
+
+```rust
+use stryx::builder::TableBuilder;
+use stryx::config::TableOptions;
+use stryx::reader::TableReader;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Write a table. With the default options, keys are sorted for you.
+    let mut table = TableBuilder::create("fruit.stryx", TableOptions::default())?;
+    table.add(b"apple", b"red")?;
+    table.add(b"banana", b"yellow")?;
+    table.add(b"cherry", b"red")?;
+    table.finalize()?;
+
+    // 2. Open it and look things up.
+    let mut reader = TableReader::open("fruit.stryx")?;
+
+    assert_eq!(reader.get(b"banana")?, Some(b"yellow".to_vec()));
+    assert_eq!(reader.get(b"durian")?, None);
+    Ok(())
+}
+```
+
+## Writing tables
+
+Configure the table with `TableOptions`:
+
+```rust
+use stryx::builder::TableBuilder;
+use stryx::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
+
+let options = TableOptions {
+    compression: Compression::Zstd,          // None | Lz4 | Zstd
+    filter_type: FilterType::BinaryFuse16,   // None | BinaryFuse8 | BinaryFuse16 | BinaryFuse32
+    block_size: 4096,                        // target size of a data block in bytes
+    key_order: KeyOrder::Lexicographic,      // sort for me; Presorted = I promise it is sorted
+    duplicate_policy: DuplicatePolicy::Reject, // Allow | Reject
+    ..TableOptions::default()
+};
+
+let mut table = TableBuilder::create("data.stryx", options)?;
+```
+
+Batches work too:
+
+```rust
+use stryx::builder::Record;
+
+let records = vec![
+    Record { key: b"a", value: b"1" },
+    Record { key: b"b", value: b"2" },
+];
+table.add_batch(records);
+let (metadata, stats) = table.finalize()?;
+```
+
+`finalize` flushes the last block, builds the filter and writes the index, metadata and footer. It returns the table metadata and write statistics.
+
+**Choosing options**
+
+| Option | Guidance |
+|--------|----------|
+| `filter_type` | Use a filter when many lookups are for keys that aren't present. Fuse8 is the smallest. Fuse16 and Fuse32 have far fewer false positives. |
+| `block_size` | Smaller blocks mean cheaper single lookups and a bigger index. Larger blocks compress better. Around 4 KB is a reasonable start for point-lookup workloads. |
+| `compression` | Lz4 is fast, Zstd compresses more. Compression mostly matters for the cost of reading a block, so a block cache helps compressed tables the most. |
+| `key_order` | `Presorted` skips sorting, but out-of-order keys are rejected. |
+
+## Reading tables
+
+### Point and batch lookups
+
+```rust
+let mut reader = TableReader::open("data.stryx")?;
+
+// One key
+let value: Option<Vec<u8>> = reader.get(b"some-key")?;
+
+// Many keys. Results come back in the same order as the input.
+let keys: Vec<&[u8]> = vec![b"a", b"zzz", b"b"];
+let values: Vec<Option<Vec<u8>>> = reader.get_many(&keys)?;
+```
+
+`get_many` sorts the keys internally and loads each block only once, so batches of nearby keys are much cheaper than the same number of `get` calls.
+
+### Sharing a table between threads
+
+Open the table once, then clone the reader for each thread. A clone shares the file handle, index and filter, and only allocates its own scratch buffers.
+
+```rust
+let reader = TableReader::open("data.stryx")?;
+
+std::thread::scope(|s| {
+    for _ in 0..4 {
+        let mut r = reader.clone();
+        s.spawn(move || {
+            let _ = r.get(b"some-key");
+        });
+    }
+});
+```
+
+Read statistics (`reader.readstats`) are kept per reader. To get totals, read them from each clone and add them up.
+
+### Reader options
+
+```rust
+use stryx::config::{BlockCacheOptions, ReaderOptions};
+
+let opts = ReaderOptions {
+    // Verify each block's CRC the first time it is read (default). Set to true to skip.
+    disable_block_verification: false,
+    // Cache up to 64 MiB of decoded blocks, shared by all readers of this table.
+    block_cache: Some(BlockCacheOptions::bytes(64 << 20).build_cache()),
+};
+
+let mut reader = TableReader::open_with_options("data.stryx", opts)?;
+```
+
+The block cache is **off by default**. It helps when the same blocks are read repeatedly (a hot set that fits in the cache) and when blocks are compressed. For uniform random reads over a table much larger than the cache it only adds overhead. A block is added to the cache on its second load, so blocks that are read only once never pay for a cache insert.
+
+Block checksums are verified **once per block** per open table. Corruption that happens after a block's first read isn't noticed until the table is opened again.
+
+## File format
+
+```text
++------------------------------------------+
+| data block 0 ... data block N-1          |   sorted records, optionally compressed
++------------------------------------------+
+| index                                    |   first key, offset, size per block
+| metadata                                 |   record count, key range, compression, ...
+| filter section (optional)                |   Binary Fuse filter + CRC32C
+| footer (29 bytes)                        |   index offset/size, filter type, version, magic
++------------------------------------------+
+```
+
+A data block holds sorted records followed by an offset table and a checksum:
+
+```text
+[record 0][record 1] ... [record N-1]
+[offset 0: u32] ... [offset N-1: u32]
+[record_count: u32][crc32c: u32]
+
+record = [key_len: u16][value_len: u32][key][value]
+```
+
+All integers are little-endian. The reader starts from the footer at the end of the file, which tells it where everything else is.
+
+A lookup does this:
+
+1. The filter says "definitely absent" or "maybe present".
+2. The index finds the one block that could contain the key.
+3. The block is read (or taken from a cache), decompressed if needed, and checksummed on first use.
+4. A binary search over the offset table finds the record.
+
+## Building and testing
+
+```bash
+cargo build --release
+cargo test
+```
+
+## License
+
+See [LICENSE](LICENSE).
