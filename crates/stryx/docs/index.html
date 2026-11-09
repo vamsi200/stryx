@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Explore Stryx Table Format</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1c1c1e;
+    --mut: #6b6b70;
+    --bd: #d8d8de;
+    --card: #f6f6f8;
+    --ac: #2563eb;
+    --a: #fde68a;
+    --b: #fca5a5;
+    --c: #bfdbfe;
+    --d: #bbf7d0;
+    --e: #ddd6fe;
+    --f: #fed7aa;
+    --g: #e5e7eb;
+    --h: #fbcfe8;
+    --gap: 8px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141417;
+      --fg: #e8e8ec;
+      --mut: #9a9aa3;
+      --bd: #33333a;
+      --card: #1d1d22;
+      --ac: #6ea0ff;
+      --a: #6b5a12;
+      --b: #7a2e2e;
+      --c: #1f3f73;
+      --d: #1d5a34;
+      --e: #4a3d80;
+      --f: #7a4a1a;
+      --g: #3a3a42;
+      --h: #7a2a58;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 14px;
+    font-weight: 400;
+    letter-spacing: -0.3px;
+    line-height: 1.45;
+    background: var(--bg);
+    color: var(--fg);
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+
+  header, main {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: var(--gap) 12px;
+  }
+
+  header { padding-top: 12px; }
+
+  h1 {
+    margin: 0 0 2px;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+
+  h3 {
+    margin: 0 0 6px;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+
+  p { margin: 0 0 var(--gap); }
+  p:last-child { margin-bottom: 0; }
+
+  .mut { color: var(--mut); }
+
+  /* Controls: square, dense */
+  button, input {
+    font-family: inherit;
+    font-size: 13px;
+    color: inherit;
+    background: var(--card);
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+    padding: 4px 10px;
+    line-height: 1.3;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:hover:not(:disabled) {
+    border-color: var(--ac);
+  }
+
+  button.on {
+    background: var(--ac);
+    color: #fff;
+    border-color: var(--ac);
+  }
+
+  button:disabled {
+    opacity: .45;
+    cursor: default;
+  }
+
+  input { border-radius: 2px; }
+
+  input:focus, button:focus-visible {
+    outline: 2px solid var(--ac);
+    outline-offset: 0;
+  }
+
+  /* Nav: flat tab strip, no rounding */
+  nav {
+    display: flex;
+    gap: 0;
+    margin-top: var(--gap);
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  nav button {
+    flex: 1;
+    border: none;
+    border-right: 1px solid var(--bd);
+    border-radius: 0;
+    background: var(--card);
+    padding: 6px 12px;
+    font-weight: 600;
+  }
+
+  nav button:last-child { border-right: none; }
+
+  nav button.on {
+    background: var(--ac);
+    color: #fff;
+  }
+
+  /* Sections */
+  section { display: none; }
+  section.on { display: block; }
+
+  /* File map bar */
+  #bar {
+    display: flex;
+    gap: 2px;
+    margin: var(--gap) 0;
+    overflow-x: auto;
+  }
+
+  .seg {
+    min-width: 64px;
+    padding: 10px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    text-align: center;
+    border: 2px solid transparent;
+    border-radius: 2px;
+    color: var(--fg);
+    line-height: 1.3;
+  }
+
+  .seg small {
+    display: block;
+    font-weight: 400;
+    opacity: .7;
+    font-size: 10px;
+  }
+
+  .seg.on {
+    border-color: var(--ac);
+  }
+
+  /* Cards: flat, square, tight */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+    padding: var(--gap) 10px;
+    margin: var(--gap) 0;
+  }
+
+  /* Hex viewer */
+  #hex {
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.9;
+    overflow-x: auto;
+    margin-top: var(--gap);
+    padding: 6px 8px;
+    background: var(--bg);
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+  }
+
+  #hex div { white-space: nowrap; }
+
+  .o {
+    color: var(--mut);
+    margin-right: 10px;
+  }
+
+  #hex i {
+    font-style: normal;
+    padding: 1px 2px;
+    margin-right: 2px;
+    border-radius: 0;
+  }
+
+  .a { background: var(--a); }
+  .b { background: var(--b); }
+  .c { background: var(--c); }
+  .d { background: var(--d); }
+  .e { background: var(--e); }
+  .f { background: var(--f); }
+  .g { background: var(--g); }
+  .h { background: var(--h); }
+
+  i.sel {
+    outline: 2px solid var(--ac);
+    outline-offset: 0;
+  }
+
+  /* Chips: square */
+  .chip {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 2px;
+    margin: 2px 4px 2px 0;
+  }
+
+  /* Records: square buttons */
+  .recs {
+    margin: var(--gap) 0;
+  }
+
+  .recs button {
+    margin: 2px 4px 2px 0;
+    padding: 2px 8px;
+    font-size: 12px;
+    border-radius: 2px;
+  }
+
+  /* Rows: consistent gap */
+  .row {
+    display: flex;
+    gap: var(--gap);
+    align-items: center;
+    flex-wrap: wrap;
+    margin: var(--gap) 0;
+  }
+
+  .row:first-child { margin-top: 0; }
+  .row:last-child { margin-bottom: 0; }
+
+  /* Pills: square */
+  .pill {
+    display: inline-block;
+    padding: 0 6px;
+    margin: 2px;
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+    font-size: 11px;
+  }
+
+  .pill.hot {
+    background: var(--ac);
+    color: #fff;
+    border-color: var(--ac);
+  }
+
+  /* Steps: flat, square */
+  .step {
+    border-left: 4px solid var(--ac);
+    padding: 6px 10px;
+    margin: var(--gap) 0;
+    background: var(--card);
+    border-radius: 0;
+    border-top: 1px solid var(--bd);
+    border-right: 1px solid var(--bd);
+    border-bottom: 1px solid var(--bd);
+  }
+
+  .step.end { border-color: #16a34a; }
+
+  .step b {
+    display: block;
+    font-size: 11px;
+    letter-spacing: 0;
+    margin-bottom: 2px;
+    color: var(--ac);
+  }
+
+  .step.end b { color: #16a34a; }
+
+  /* Code */
+  code {
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--bg);
+    padding: 0 4px;
+    border-radius: 2px;
+    border: 1px solid var(--bd);
+  }
+
+  li { margin: 2px 0; }
+  ol, ul { margin: 0; padding-left: 18px; }
+
+  /* Lookup state */
+  #state {
+    font-size: 12px;
+    padding: 6px 8px;
+    background: var(--bg);
+    border: 1px solid var(--bd);
+    border-radius: 2px;
+    margin-top: var(--gap);
+    line-height: 1.6;
+  }
+
+  #state b { color: var(--ac); }
+
+  /* Tighten card internals */
+  .card > * + * { margin-top: var(--gap); }
+  .card h3 + p,
+  .card h3 + ol,
+  .card h3 + ul { margin-top: 0; }
+  .card .row { margin: 0; }
+  .card .chip { margin-bottom: 0; }
+
+  /* Bar scrollbar */
+  #bar::-webkit-scrollbar, #hex::-webkit-scrollbar { height: 6px; }
+  #bar::-webkit-scrollbar-thumb, #hex::-webkit-scrollbar-thumb {
+    background: var(--bd);
+    border-radius: 0;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stryx Table Format</h1>
+  <div class="mut">A example table with 9 records in 3 blocks. Block, index and footer bytes are generated live in your browser (real CRC32C). Filter and metadata bytes are illustrative.</div>
+  <nav>
+    <button data-t="map" class="on">File map</button>
+    <button data-t="look">Lookup</button>
+  </nav>
+</header>
+
+<main>
+  <section id="map" class="on">
+    <div id="bar"></div>
+    <div class="row">
+      <button id="trace">▶ Trace open()</button>
+      <span id="cap" class="mut">Click a section, or trace how the file is opened.</span>
+    </div>
+    <div id="panel" class="card"></div>
+  </section>
+
+  <section id="look">
+    <div class="card">
+      <div class="row">
+        <input id="key" list="keys" placeholder="type a key, e.g. cherry" size="22">
+        <datalist id="keys"></datalist>
+        <label><input type="checkbox" id="cache" checked> block cache on</label>
+        <label><input type="checkbox" id="fp"> force filter false positive</label>
+      </div>
+      <div class="row">
+        <button id="go">Lookup</button>
+        <button id="nx">Next step</button>
+        <button id="all">Run all</button>
+        <button id="rs">Reset reader state</button>
+      </div>
+      <div id="state" class="mut"></div>
+    </div>
+    <div id="steps"></div>
+  </section>
+</main>
+
+<script>
+const E=new TextEncoder(),$=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const u16=n=>[n&255,(n>>8)&255],u32=n=>[n&255,(n>>>8)&255,(n>>>16)&255,(n>>>24)&255],u64=n=>[...u32(n),0,0,0,0];
+const T=(()=>{const t=[];for(let i=0;i<256;i++){let c=i;for(let k=0;k<8;k++)c=c&1?(c>>>1)^0x82F63B78:c>>>1;t.push(c>>>0)}return t})();
+const crc=b=>{let c=-1;for(const x of b)c=T[(c^x)&255]^(c>>>8);return ~c>>>0};
+const hx=n=>n.toString(16).padStart(2,'0'),esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const D=[["apple","red"],["avocado","green"],["banana","yellow"],["blueberry","blue"],["cherry","red"],["grape","purple"],["kiwi","green"],["lemon","yellow"],["mango","orange"]];
+let pos=0;
+const blocks=[0,1,2].map(i=>{
+  const rs=D.slice(i*3,i*3+3),b=[],cls=[],recs=[],offs=[];
+  const p=(a,c)=>a.forEach(x=>{b.push(x);cls.push(c)});
+  rs.forEach(([k,v])=>{const s=b.length,kb=[...E.encode(k)],vb=[...E.encode(v)];offs.push(s);
+    p(u16(kb.length),'a');p(u32(vb.length),'b');p(kb,'c');p(vb,'d');recs.push({k,v,s,e:b.length})});
+  offs.forEach(o=>p(u32(o),'e'));p(u32(rs.length),'f');p(u32(crc(b)),'g');
+  const blk={start:pos,bytes:b,cls,recs,offs};pos+=b.length;return blk});
+const iB=[],iC=[],ip=(a,c)=>a.forEach(x=>{iB.push(x);iC.push(c)});
+blocks.forEach(bl=>{const kb=[...E.encode(bl.recs[0].k)];ip(u16(kb.length),'a');ip(kb,'c');ip(u64(bl.start),'e');ip(u32(bl.bytes.length),'d');ip(u32(bl.bytes.length),'b')});
+ip(u32(3),'f');ip(u32(crc(iB)),'g');
+const idxStart=pos,metaStart=idxStart+iB.length,filtStart=metaStart+48,footStart=filtStart+52,fileSize=footStart+29;
+const mB=[],mC=[],mp=(a,c)=>a.forEach(x=>{mB.push(x);mC.push(c)});
+mp(u64(40),'f');[9,3,fileSize,idxStart,iB.length].forEach(v=>mp(u64(v),'e'));
+const fB=[],fC=[],fp=(a,c)=>a.forEach(x=>{fB.push(x);fC.push(c)});
+const fd=[];const fq=(a)=>fd.push(...a);
+fq(u64(0x1234567));fq(u32(4));fq(u32(3));fq(u32(8));fq(u32(16));fq([7,201,33,90,144,12,250,66,3,178,99,21,140,57,222,8]);
+fp(u64(fd.length),'f');
+[[8,'a'],[4,'b'],[4,'c'],[4,'d'],[4,'e'],[16,'g']].reduce((o,[n,c])=>{fp(fd.slice(o,o+n),c);return o+n},0);
+fp(u32(crc(fd)),'h');
+const tB=[],tC=[],tp=(a,c)=>a.forEach(x=>{tB.push(x);tC.push(c)});
+tp(u64(idxStart),'a');tp(u64(iB.length),'b');tp([1],'c');tp(u32(1),'d');tp([...E.encode('STRYXFMT')],'e');
+
+const segs=[
+ ...blocks.map((bl,i)=>({id:'b'+i,name:'Block '+i,col:'c',start:bl.start,bytes:bl.bytes,cls:bl.cls,recs:bl.recs,
+  desc:'Sorted records, then a u32 offset table (relative to block start), record_count and a CRC32C over everything before it. Each record: key_len u16, value_len u32, key, value. Offsets are fixed width, which is what makes in-block binary search possible.',
+  leg:{a:'key_len u16',b:'value_len u32',c:'key',d:'value',e:'offset u32',f:'record_count u32',g:'crc32c'},
+  fields:[['first key',bl.recs[0].k],['records',bl.recs.length],['size',bl.bytes.length+' bytes (uncompressed)']]})),
+ {id:'index',name:'Index',col:'d',start:idxStart,bytes:iB,cls:iC,desc:'One sparse entry per block holding its first key. After open the keys are kept in one contiguous buffer with a dense u64 prefix array for fast search. The CRC covers all entries plus the count.',
+  leg:{a:'key_len u16',c:'first_key',e:'offset u64',d:'size u32',b:'uncompressed size u32',f:'count u32',g:'crc32c'},fields:[['entries',3],['size',iB.length+' bytes']]},
+ {id:'meta',name:'Metadata',col:'e',start:metaStart,bytes:mB,cls:mC,desc:'Length-prefixed TableMetadata: record_count, block_count, file_size, min_key, max_key, index_offset, index_size, compression. Layout shown is illustrative.',
+  leg:{f:'length u64',e:'field u64 (illustrative)'},fields:[['record_count',9],['block_count',3],['file_size',fileSize]]},
+ {id:'filter',name:'Filter',col:'f',start:filtStart,bytes:fB,cls:fC,desc:'Optional BinaryFuse filter over xxh3_64(key) hashes. Length excludes the crc. segment_length is a power of two, mask = segment_length − 1, and fingerprints must cover segment_count_length + 2 × segment_length. Fingerprint bytes here are made up.',
+  leg:{f:'filter_len u64',a:'seed u64',b:'segment_length u32',c:'segment_length_mask u32',d:'segment_count_length u32',e:'fingerprint_length u32',g:'fingerprints (u8)',h:'crc32c'},fields:[['type','BinaryFuse8 (illustrative)'],['false positives','about 1 in 256']]},
+ {id:'footer',name:'Footer',col:'a',start:footStart,bytes:tB,cls:tC,desc:'Fixed 29 bytes at the very end. Everything else is located from here. Magic and version values are illustrative.',
+  leg:{a:'index_offset u64',b:'index_size u64',c:'filter_type u8',d:'version u32',e:'magic (8 bytes)'},fields:[['index_offset',idxStart],['index_size',iB.length],['filter_type',1],['version',1]]}
+];
+
+let cur=null;
+function sel(id){
+  cur=segs.find(s=>s.id===id);const s=cur;
+  $$('.seg').forEach(x=>x.classList.toggle('on',x.dataset.id===id));
+  let h='<h3>'+s.name+' <span class="mut">· offset '+s.start+' · '+s.bytes.length+' bytes</span></h3><div>'+s.desc+'</div><div class="row">'
+   +Object.entries(s.leg).map(([c,l])=>'<span class="chip '+c+'">'+l+'</span>').join('')+'</div>'
+   +'<div class="mut">'+s.fields.map(f=>f[0]+': <b>'+f[1]+'</b>').join(' · ')+'</div>';
+  if(s.recs)h+='<div class="recs">Records: '+s.recs.map((r,i)=>'<button data-r="'+i+'">'+r.k+' → '+r.v+'</button>').join('')+'</div>';
+  h+='<div id="hex">';
+  for(let r=0;r<s.bytes.length;r+=16){h+='<div><span class="o">'+(s.start+r).toString(16).padStart(4,'0')+'</span>'
+    +s.bytes.slice(r,r+16).map((b,j)=>'<i class="'+s.cls[r+j]+'" data-i="'+(r+j)+'" title="'+s.leg[s.cls[r+j]]+' @'+(s.start+r+j)+'">'+hx(b)+'</i>').join('')+'</div>'}
+  $('#panel').innerHTML=h+'</div>';
+  $$('.recs button').forEach(b=>b.onclick=()=>{const r=s.recs[+b.dataset.r];
+    $$('#hex i').forEach(x=>x.classList.toggle('sel',+x.dataset.i>=r.s&&+x.dataset.i<r.e))});
+}
+const tot=fileSize;
+$('#bar').innerHTML=segs.map(s=>'<button class="seg" data-id="'+s.id+'" style="flex:'+Math.max(s.bytes.length,tot*.06)+' 1 0;background:var(--'+s.col+')">'+s.name+'<br><small>'+s.bytes.length+' B</small></button>').join('');
+$$('.seg').forEach(b=>b.onclick=()=>sel(b.dataset.id));
+$('#trace').onclick=async()=>{const st=[['footer','Read the last 29 bytes: check magic and version, get index_offset, index_size, filter_type.'],['index','Seek to index_offset, read index_size bytes, verify the CRC32C, decode the entries.'],['meta','Metadata starts at index_offset + index_size: read the length, then the fields.'],['filter','If filter_type is not None: read length, data, CRC32C, then rebuild the filter.'],['b0','Data blocks are not read on open. Each one is loaded on demand by get().']];
+  $('#trace').disabled=true;for(const[i,t]of st){sel(i);$('#cap').textContent=t;await new Promise(r=>setTimeout(r,1900))}$('#trace').disabled=false};
+sel('footer');
+
+/* lookup */
+const fk=blocks.map(b=>b.recs[0].k);
+const pre=k=>{const a=[...E.encode(k)].slice(0,8);while(a.length<8)a.push(0);return a.reduce((x,y)=>x*256n+BigInt(y),0n)};
+let S,steps=[],shown=0;
+const reset=()=>{S={loaded:null,cache:new Set(),seen:new Set(),ver:new Set()};draw()};
+function draw(){
+  $('#state').innerHTML='Reader state → loaded_idx: <b>'+(S.loaded===null?'none':S.loaded)+'</b> · cache: <b>{'+[...S.cache]+'}</b> · seen: <b>{'+[...S.seen]+'}</b> · CRC verified: <b>{'+[...S.ver]+'}</b>';
+  $('#steps').innerHTML=steps.slice(0,shown).map(s=>'<div class="step'+(s.end?' end':'')+'"><b>'+s.t+'</b><div>'+s.h+'</div>'
+    +(s.b!==undefined?'<div>'+blocks[s.b].recs.map((r,i)=>'<span class="pill'+(i===s.m?' hot':'')+'">'+r.k+'</span>').join('')+'</div>':'')+'</div>').join('');
+  $('#nx').disabled=shown>=steps.length;
+}
+function plan(key){
+  steps=[];const add=(t,h,end,b,m)=>steps.push({t,h,end,b,m}),k=esc(key);
+  const inSet=D.some(d=>d[0]===key);
+  if(!inSet&&!$('#fp').checked){add('1 · Filter','xxh3("'+k+'") → 3 fingerprint probes → <b>definitely absent</b>. Return None: no index, no block, no disk.',1);return}
+  add('1 · Filter',inSet?'probes pass → <b>maybe present</b>.':'probes pass by chance: a <b>false positive</b> (about 1 in 256 for Fuse8).');
+  const kp=pre(key),P=fk.map(pre),lo=P.filter(x=>x<kp).length,eq=P.filter(x=>x===kp).length,ties=fk.filter((q,i)=>P[i]===kp&&q<=key).length,p=lo+ties;
+  add('2 · Index','prefix = 0x'+kp.toString(16).padStart(16,'0')+' (shared prefix here is empty). '+lo+' first-key prefixes are smaller'+(eq?', '+eq+' equal → full-key compare, '+ties+' ≤ key':'')+'. So '+p+' first keys are ≤ key.'+(p?' Block = '+(p-1)+'.':' The key sorts before every block → <b>None</b>.'),p?0:1);
+  if(!p)return;
+  const b=p-1,bl=blocks[b],cOn=$('#cache').checked;let src;
+  if(S.loaded===b)src='<b>same block as the last lookup</b> (loaded_idx): scratch buffer reused, no read, no cache lookup.';
+  else if(cOn&&S.cache.has(b))src='<b>cache hit</b>: shared decoded block, no read, no decompress, no CRC.';
+  else{src='<b>disk</b>: pread(offset '+bl.start+', '+bl.bytes.length+' bytes)'+(S.ver.has(b)?'':', CRC32C verified (first touch)')+'.';
+    if(cOn)src+=S.seen.has(b)?' Second load → promoted into the cache.':' First load → only marked seen (one-shot blocks never pay for a cache insert).';
+    S.ver.add(b);S.loaded=b;if(cOn){S.seen.has(b)?S.cache.add(b):S.seen.add(b)}}
+  add('3 · Get block '+b,src,0,b);
+  const R=bl.recs;let L=0,H=R.length;
+  while(L<H){const m=(L+H)>>1,q=R[m].k,lt=q<key;
+    add('4 · Search inside block','lo='+L+' hi='+H+' mid='+m+' → offset['+m+'] = '+bl.offs[m]+' → key "'+q+'" '+(lt?'&lt; ':'≥ ')+'"'+k+'" → '+(lt?'lo = '+(m+1):'hi = '+m),0,b,m);
+    lt?L=m+1:H=m}
+  const f=L<R.length&&R[L].k===key;
+  add('5 · Result',f?'Record '+L+' matches. Return <b>"'+R[L].v+'"</b> (value copied out).':'lo = '+L+(L<R.length?' lands on "'+R[L].k+'", which is not equal':' is past the last record')+'. Return <b>None</b>.',1,b,f?L:-1);
+}
+$('#keys').innerHTML=D.map(d=>'<option value="'+d[0]+'">').join('');
+$('#go').onclick=()=>{plan($('#key').value.trim());shown=1;draw()};
+$('#key').onkeydown=e=>{if(e.key==='Enter')$('#go').click()};
+$('#nx').onclick=()=>{shown++;draw()};
+$('#all').onclick=()=>{if(!steps.length)plan($('#key').value.trim());shown=steps.length;draw()};
+$('#rs').onclick=()=>{steps=[];shown=0;reset()};
+reset();
+
+$$('nav button').forEach(b=>b.onclick=()=>{$$('nav button').forEach(x=>x.classList.toggle('on',x===b));$$('section').forEach(s=>s.classList.toggle('on',s.id===b.dataset.t))});
+</script>
+</body>
+</html>
