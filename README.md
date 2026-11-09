@@ -139,6 +139,8 @@ Block checksums are verified **once per block** per open table. Corruption that 
 
 ## File format
 
+An Interactive site of the format - [LINK](https://vamsi200.github.io/stryx/)
+
 ```text
 +------------------------------------------+
 | data block 0 ... data block N-1          |   sorted records, optionally compressed
