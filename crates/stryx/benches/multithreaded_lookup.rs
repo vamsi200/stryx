@@ -257,7 +257,7 @@ fn bench_get_by_options(c: &mut Criterion) {
 
     let n = 10_000;
 
-    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd(1)] {
         for block_size in [1024usize, 4096, 16_384] {
             let fx = build_table(n, compression, FilterType::BinaryFuse16, block_size);
             let keys = sample_keys(&fx, 512);

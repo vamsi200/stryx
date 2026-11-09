@@ -1,11 +1,5 @@
-#![allow(unused)]
-
+use crate::{decoder::Decoder, error::StryxError};
 use std::cmp::Ordering;
-
-use crate::{
-    decoder::Decoder,
-    error::{DecodeError, StryxError},
-};
 
 #[derive(Debug)]
 pub(crate) struct IndexBuilder {
@@ -13,7 +7,7 @@ pub(crate) struct IndexBuilder {
 }
 
 impl IndexBuilder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             index: Index {
                 key_data: Vec::new(),
@@ -24,7 +18,13 @@ impl IndexBuilder {
         }
     }
 
-    pub fn add(&mut self, first_key: &[u8], offset: u64, size: u32, uncompressed_block_size: u32) {
+    pub(crate) fn add(
+        &mut self,
+        first_key: &[u8],
+        offset: u64,
+        size: u32,
+        uncompressed_block_size: u32,
+    ) {
         let key_offset = self.index.key_data.len() as u32;
         let key_len = first_key.len() as u16;
 
@@ -44,7 +44,7 @@ impl IndexBuilder {
         });
     }
 
-    pub fn finish(self) -> Result<Vec<u8>, StryxError> {
+    pub(crate) fn finish(self) -> Result<Vec<u8>, StryxError> {
         let mut encoded = Vec::new();
 
         self.index.encode(&mut encoded)?;
@@ -60,7 +60,7 @@ impl IndexBuilder {
 }
 
 #[derive(Debug)]
-pub struct Index {
+pub(crate) struct Index {
     /// Concatenated first keys from all index entries.
     pub key_data: Vec<u8>,
 
@@ -83,7 +83,7 @@ fn prefix_be(b: &[u8]) -> u64 {
 }
 
 impl Index {
-    pub fn build_prefixes(&mut self) {
+    pub(crate) fn build_prefixes(&mut self) {
         let n = self.entries.len();
         self.lcp_len = if n == 0 {
             0
@@ -95,7 +95,7 @@ impl Index {
         self.key_prefixes = (0..n).map(|i| prefix_be(&self.first_key(i)[l..])).collect();
     }
 
-    pub fn encode(&self, dst: &mut Vec<u8>) -> Result<(), StryxError> {
+    pub(crate) fn encode(&self, dst: &mut Vec<u8>) -> Result<(), StryxError> {
         for (i, entry) in self.entries.iter().enumerate() {
             let first_key = self.first_key(i);
             let key_len = u16::try_from(first_key.len())?;
@@ -110,7 +110,10 @@ impl Index {
         Ok(())
     }
 
-    pub fn decode(decoder: &mut Decoder<'_>, entry_count: usize) -> Result<Self, StryxError> {
+    pub(crate) fn decode(
+        decoder: &mut Decoder<'_>,
+        entry_count: usize,
+    ) -> Result<Self, StryxError> {
         let mut index = Self {
             key_data: Vec::new(),
             entries: Vec::with_capacity(entry_count),
@@ -143,14 +146,14 @@ impl Index {
         Ok(index)
     }
 
-    pub fn first_key(&self, index: usize) -> &[u8] {
+    pub(crate) fn first_key(&self, index: usize) -> &[u8] {
         let entry = &self.entries[index];
         let start = entry.key_offset as usize;
         let end = start + entry.key_len as usize;
         &self.key_data[start..end]
     }
 
-    pub fn partition_point_le_from(&self, start: usize, key: &[u8]) -> usize {
+    pub(crate) fn partition_point_le_from(&self, start: usize, key: &[u8]) -> usize {
         let n = self.entries.len();
         if start >= n {
             return n;
@@ -185,7 +188,7 @@ impl Index {
     }
 
     #[inline]
-    pub fn partition_point_le(&self, key: &[u8]) -> usize {
+    pub(crate) fn partition_point_le(&self, key: &[u8]) -> usize {
         self.partition_point_le_from(0, key)
     }
 }

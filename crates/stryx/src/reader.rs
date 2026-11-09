@@ -1,20 +1,16 @@
-#![allow(unused)]
-
 use std::{
     fmt::Debug,
     fs::File,
     io::{Read, Seek},
-    num::NonZeroU64,
     os::unix::fs::FileExt,
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     vec,
 };
 
-use anyhow::Result;
 use bytes::Bytes;
 use quick_cache::Weighter;
 use xorf::Filter;
@@ -26,9 +22,8 @@ use crate::{
     decoder::Decoder,
     error::{DecodeError, StryxError},
     helper::filter_decode,
-    index::{Index, IndexEntry},
+    index::Index,
 };
-use std::sync::atomic::Ordering::Relaxed;
 use zstd::bulk::Decompressor;
 
 #[derive(Clone)]
@@ -40,10 +35,24 @@ impl Weighter<u32, Arc<Vec<u8>>> for BlockWeighter {
     }
 }
 
+/// A thread-safe cache for frequently accessed data blocks.
+///
+/// `BlockCache` is a newtype wrapper around a concurrent cache implementation from
+/// the `quick_cache` crate, designed to reduce expensive disk or network reads by
+/// keeping hot blocks in memory.
 #[derive(Debug)]
-pub struct BlockCacheQuick(quick_cache::sync::Cache<u32, Arc<Vec<u8>>, BlockWeighter>);
+pub struct BlockCache(quick_cache::sync::Cache<u32, Arc<Vec<u8>>, BlockWeighter>);
 
-impl BlockCacheQuick {
+impl BlockCache {
+    /// Creates a new `BlockCache` configured with a maximum memory limit in bytes.
+    ///
+    /// # Arguments
+    /// - `max_bytes`: The total maximum memory footprint allowed for cached blocks.
+    ///
+    /// # Implementation Details
+    /// This constructor estimates the initial item capacity by assuming an average
+    /// block size of 4 KB (enforcing a safe minimum of 16 items). It delegates
+    /// tracking and eviction to `quick_cache` using the custom `BlockWeighter`.
     pub fn new(max_bytes: u64) -> Self {
         let est_items = ((max_bytes / 4096).max(16)) as usize;
         Self(quick_cache::sync::Cache::with_weighter(
@@ -76,22 +85,24 @@ impl Debug for BlockDecoder {
 }
 
 impl BlockDecoder {
-    fn new(compression: Compression) -> std::io::Result<Self> {
-        Ok(Self {
-            zstd: matches!(compression, Compression::Zstd)
-                .then(Decompressor::new)
-                .transpose()?,
+    fn new() -> Self {
+        Self {
+            zstd: None,
             out: Vec::new(),
-        })
+        }
     }
 
     fn zstd(&mut self, src: &[u8], max_len: usize) -> Result<(&[u8], bool), StryxError> {
+        if self.zstd.is_none() {
+            self.zstd = Some(Decompressor::new()?);
+        }
+
         self.out.clear();
         self.out.reserve(max_len);
         let n = self
             .zstd
             .as_mut()
-            .unwrap()
+            .ok_or(StryxError::InvalidState("Zstd decoder not initialized"))?
             .decompress_to_buffer(src, &mut self.out)?;
         debug_assert_eq!(n, self.out.len());
         Ok((&self.out, true))
@@ -113,7 +124,6 @@ impl BlockDecoder {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct BlockReader<'a> {
     buf: &'a [u8],
@@ -154,7 +164,12 @@ impl<'a> BlockReader<'a> {
 
     #[inline]
     fn offset(&self, i: usize) -> usize {
-        u32::from_le_bytes(self.offsets[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+        let start = i * 4;
+        let bytes: [u8; 4] = self.offsets[start..start + 4]
+            .try_into()
+            .expect("invalid offset index");
+
+        u32::from_le_bytes(bytes) as usize
     }
 
     fn record_at(&self, offset: usize) -> Result<(&'a [u8], &'a [u8]), StryxError> {
@@ -188,10 +203,17 @@ impl<'a> BlockReader<'a> {
         }
 
         // last 4 bytes contain checksum in the Data Block
-        let stored = u32::from_le_bytes(buf[n - 4..].try_into().unwrap());
+        let stored = u32::from_le_bytes(
+            buf.get(n - 4..)
+                .ok_or(StryxError::InvalidData("missing checksum"))?
+                .try_into()
+                .map_err(|_| StryxError::InvalidData("invalid checksum length"))?,
+        );
+
         if crc32c::crc32c(&buf[..n - 4]) != stored {
             return Err(StryxError::InvalidChecksum);
         }
+
         Ok(())
     }
 
@@ -245,19 +267,26 @@ impl<'a> BlockReader<'a> {
     }
 }
 
-#[derive(Debug)]
+/// Configuration options for controlling the behavior and performance of the reader.
+#[derive(Debug, Default)]
 pub struct ReaderOptions {
+    /// When set to `true`, disables block-level verification (checksum validation)
+    /// when reading blocks from file.
+    ///
+    /// # Performance vs. Safety Trade-off
+    /// - **`true` (Disabled):** Improves read throughput and reduces CPU overhead by skipping
+    ///   integrity checks. Use with caution if storage reliability cannot be guaranteed.
+    /// - **`false` (Enabled - Recommended):** Ensures that data blocks are verified upon reading
+    ///   to protect against data corruption.
     pub disable_block_verification: bool,
-    pub block_cache: Option<BlockCacheQuick>,
-}
 
-impl Default for ReaderOptions {
-    fn default() -> Self {
-        Self {
-            disable_block_verification: true, // change this
-            block_cache: None,
-        }
-    }
+    /// An optional block cache (`BlockCache`) used to store frequently accessed data blocks in memory.
+    ///
+    /// - **`Some(BlockCache)`:** Enables caching. Subsequent reads for blocks already present in
+    ///   the cache are served directly from memory, significantly reducing disk/network I/O latency.
+    /// - **`None`:** Disables block caching for this reader; all data blocks will be fetched directly
+    ///   from the underlying storage backend.
+    pub block_cache: Option<BlockCache>,
 }
 
 #[derive(Debug)]
@@ -268,18 +297,28 @@ pub(crate) struct SharedTable {
     disable_block_verification: bool,
     crc_verification: Vec<AtomicBool>,
     filter: XorFilter,
-    block_cache: Option<BlockCacheQuick>,
+    block_cache: Option<BlockCache>,
     block_seen: Vec<AtomicBool>,
 }
 
+/// A reader responsible for efficiently traversing, decoding, and reading blocks
+/// from the stryx file.
 #[derive(Debug)]
 pub struct TableReader {
     pub readstats: ReadStats,
     shared: Arc<SharedTable>,
+
+    // Internal reusable byte buffer
     block_buf: Vec<u8>,
+
+    // Decoder engine responsible for decompressing and deserializing etc..
     block_decoder: BlockDecoder,
+
+    // Index ordering vector used to determine or track the traversal sequence
+    // of blocks within the table.
     order: Vec<usize>,
-    loaded_idx: Option<usize>, // block currently decoded
+
+    loaded_idx: Option<usize>,
 }
 
 /// Cloning the reader creates a new scratchpad for a new thread,
@@ -290,7 +329,7 @@ impl Clone for TableReader {
             readstats: ReadStats::default(),
             shared: Arc::clone(&self.shared),
             block_buf: Vec::with_capacity(BLOCK_SIZE),
-            block_decoder: BlockDecoder::new(self.shared.metadata.compression).unwrap(),
+            block_decoder: BlockDecoder::new(),
             order: Vec::new(),
             loaded_idx: None,
         }
@@ -454,12 +493,6 @@ impl TableReader {
 
         index.build_prefixes();
 
-        let block_decoder = match metadata.compression {
-            Compression::Zstd => BlockDecoder::new(Compression::Zstd)?,
-            Compression::Lz4 => BlockDecoder::new(Compression::Lz4)?,
-            Compression::None => BlockDecoder::new(Compression::None)?,
-        };
-
         let share_table = Arc::new(SharedTable {
             file,
             index,
@@ -475,7 +508,7 @@ impl TableReader {
             readstats: ReadStats::default(),
             shared: share_table,
             block_buf: Vec::new(),
-            block_decoder,
+            block_decoder: BlockDecoder::new(),
             order: Vec::new(),
             loaded_idx: None,
         })
@@ -492,7 +525,17 @@ impl TableReader {
         }
     }
 
-    /// Find the value associated with a key.
+    /// Retrieves the value associated with the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Reading the underlying SSTable fails.
+    /// - A data block is corrupted.
+    /// - Checksum verification fails.
+    /// - Block decompression or decoding fails.
+    ///
+    /// Returns `Ok(None)` if the key does not exist.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
         if !self.xorf_contains(key) {
             self.readstats.point_misses += 1;
@@ -513,17 +556,11 @@ impl TableReader {
         // the requested key `could be` in previous one
         let idx = block - 1;
 
-        // check cache first: a hit skips read, decompress and CRC
-        let cached = self
-            .shared
-            .block_cache
-            .as_ref()
-            .and_then(|c| c.get(&(idx as u32)));
-
         let result = if self.loaded_idx == Some(idx) {
             // same block as the previous lookup, the scratch still holds the block
             Self::search_block(self.loaded_block(), key)
         } else {
+            // check cache first: a hit skips read, decompress and CRC
             let cached = self
                 .shared
                 .block_cache
@@ -542,10 +579,10 @@ impl TableReader {
 
                 // insert only on the SECOND load of a block, so one-shot blocks
                 // never pay for the allocation, the copy or the insert
-                if let Some(cache) = &self.shared.block_cache {
-                    if self.shared.block_seen[idx].swap(true, Ordering::Relaxed) {
-                        cache.insert(idx as u32, Arc::from(self.loaded_block().to_vec()));
-                    }
+                if let Some(cache) = &self.shared.block_cache
+                    && self.shared.block_seen[idx].swap(true, Ordering::Relaxed)
+                {
+                    cache.insert(idx as u32, Arc::from(self.loaded_block().to_vec()));
                 }
 
                 Self::search_block(self.loaded_block(), key)
@@ -655,16 +692,18 @@ impl TableReader {
         Ok(results)
     }
 
-    pub fn get_bytes(&mut self, key: &[u8]) -> Result<Option<Bytes>, StryxError> {
-        todo!()
+    #[allow(unused)]
+    pub fn get_in_bytes(&mut self, key: &[u8]) -> Result<Option<Bytes>, StryxError> {
+        Err(StryxError::NotImplemented)
     }
 
-    pub fn get_many_bytes(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, StryxError> {
-        todo!()
+    #[allow(unused)]
+    pub fn get_many_in_bytes(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, StryxError> {
+        Err(StryxError::NotImplemented)
     }
 
     /// Iterate over all records in sorted order.
-    pub fn iter(&mut self) -> impl Iterator<Item = Result<OwnedRecord, StryxError>> + '_ {
+    pub fn iter(&mut self) -> impl Iterator<Item = Result<OwnedRecord, StryxError>> {
         self.readstats.iter_queries += 1;
         TableIterator::new(self)
     }
@@ -685,8 +724,6 @@ impl TableReader {
             block_idx -= 1;
         }
 
-        let compression = self.shared.metadata.compression;
-
         self.readstats.range_queries += 1;
 
         Ok(TableIterator {
@@ -699,14 +736,11 @@ impl TableReader {
             prefix: None,
             finished: false,
             stop_after_current_block: false,
-            compression,
         })
     }
 
     /// Iterate over keys sharing a prefix.
     pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
-        let compression = self.shared.metadata.compression;
-
         self.readstats.prefix_queries += 1;
 
         Ok(TableIterator {
@@ -719,7 +753,6 @@ impl TableReader {
             prefix: Some(prefix.to_vec()),
             finished: false,
             stop_after_current_block: false,
-            compression,
         })
     }
 
@@ -755,7 +788,7 @@ impl TableReader {
         self.readstats.bytes_read += u64::from(size);
 
         let (data, decompressed): (&[u8], bool) = match self.shared.metadata.compression {
-            Compression::Zstd => self
+            Compression::Zstd(_) => self
                 .block_decoder
                 .zstd(&self.block_buf, uncompressed_size as usize)?,
             Compression::Lz4 => self
@@ -789,37 +822,13 @@ impl TableReader {
     fn loaded_block(&self) -> &[u8] {
         match self.shared.metadata.compression {
             Compression::None => &self.block_buf,
-            Compression::Zstd | Compression::Lz4 => self.block_decoder.out(),
+            Compression::Zstd(_) | Compression::Lz4 => self.block_decoder.out(),
         }
-    }
-
-    fn lookup_in(&mut self, idx: usize, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
-        self.load_block(idx)?;
-
-        let result: Option<Vec<u8>> = {
-            let block = self.loaded_block();
-
-            let reader = match BlockReader::new(&block) {
-                Ok(r) => r,
-                Err(err) => {
-                    if matches!(err, StryxError::InvalidChecksum) {
-                        self.readstats.checksum_failures += 1;
-                    }
-                    return Err(err);
-                }
-            };
-
-            reader.get(key)?.map(|res| res.0.to_vec())
-        };
-
-        match &result {
-            Some(_) => self.readstats.point_hits += 1,
-            None => self.readstats.point_misses += 1,
-        }
-        Ok(result)
     }
 }
 
+/// Statistics tracker recording performance metrics such as read operations,
+/// bytes read, and cache performance.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadStats {
     /// Number of data blocks successfully read from the file.
@@ -960,12 +969,14 @@ impl std::fmt::Display for ReadStats {
     }
 }
 
+/// OwnedRecord with keys and values
 #[derive(Debug)]
 pub struct OwnedRecord {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
 
+/// Iterator for the table
 pub struct TableIterator<'a> {
     reader: &'a mut TableReader,
     block_idx: usize,
@@ -976,13 +987,10 @@ pub struct TableIterator<'a> {
     prefix: Option<Vec<u8>>,
     stop_after_current_block: bool,
     finished: bool,
-    compression: Compression,
 }
 
 impl<'a> TableIterator<'a> {
     fn new(reader: &'a mut TableReader) -> Self {
-        let compression = reader.shared.metadata.compression;
-
         Self {
             reader,
             block_idx: 0,
@@ -993,7 +1001,6 @@ impl<'a> TableIterator<'a> {
             prefix: None,
             finished: false,
             stop_after_current_block: false,
-            compression,
         }
     }
 }
@@ -1061,25 +1068,24 @@ impl Iterator for TableIterator<'_> {
                 self.reader.readstats.blocks_read += 1;
                 self.reader.readstats.bytes_read += u64::from(size);
 
-                let (block_buf, decompressed) =
-                    if self.reader.shared.metadata.compression == Compression::Zstd {
-                        self.reader
-                            .block_decoder
-                            .zstd(&self.reader.block_buf, uncompressed_block_size as usize)?
-                    } else if self.reader.shared.metadata.compression == Compression::Lz4 {
-                        self.reader
-                            .block_decoder
-                            .lz4(&self.reader.block_buf, uncompressed_block_size as usize)?
-                    } else {
-                        (self.reader.block_buf.as_slice(), false)
-                    };
+                let (block, decompressed) = match self.reader.shared.metadata.compression {
+                    Compression::Zstd(_) => self
+                        .reader
+                        .block_decoder
+                        .zstd(&self.reader.block_buf, uncompressed_block_size as usize)?,
+                    Compression::Lz4 => self
+                        .reader
+                        .block_decoder
+                        .lz4(&self.reader.block_buf, uncompressed_block_size as usize)?,
+                    Compression::None => (self.reader.block_buf.as_slice(), false),
+                };
 
                 if decompressed {
                     self.reader.readstats.blocks_decompressed += 1;
-                    self.reader.readstats.bytes_decompressed += block_buf.len() as u64;
+                    self.reader.readstats.bytes_decompressed += block.len() as u64;
                 }
 
-                let records = BlockReader::new(&block_buf)?.records()?;
+                let records = BlockReader::new(block)?.records()?;
 
                 // take the start_key, so that subsequent blocks start at index 0
                 let start_pos = self

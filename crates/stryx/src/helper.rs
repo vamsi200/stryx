@@ -175,7 +175,10 @@ fn decode_fuse32(data: &[u8]) -> Result<BinaryFuse32, StryxError> {
     })
 }
 
-pub fn filter_decode(data: &[u8], selected_type: FilterTypeRepr) -> Result<XorFilter, StryxError> {
+pub(crate) fn filter_decode(
+    data: &[u8],
+    selected_type: FilterTypeRepr,
+) -> Result<XorFilter, StryxError> {
     match selected_type {
         FilterTypeRepr::None => Ok(XorFilter::None),
         FilterTypeRepr::BinaryFuse8 => Ok(XorFilter::BinaryFuse8(decode_fuse8(data)?)),

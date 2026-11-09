@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stryx::builder::TableBuilder;
 use stryx::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
-use stryx::reader::{BlockCacheQuick, ReaderOptions, TableReader};
+use stryx::reader::{BlockCache, ReaderOptions, TableReader};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -21,7 +21,7 @@ impl Drop for Table {
 }
 
 fn options() -> ReaderOptions {
-    let block_cache_opts = BlockCacheQuick::new(16 * 1024 * 1024);
+    let block_cache_opts = BlockCache::new(16 * 1024 * 1024);
 
     ReaderOptions {
         disable_block_verification: true,
@@ -194,7 +194,7 @@ fn bench_get_by_options(c: &mut Criterion) {
 
     let n = 10_000;
 
-    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd(1)] {
         for block_size in [1024usize, 4096, 16_384] {
             let fx = build_table(n, compression, FilterType::BinaryFuse16, block_size);
             let keys = sample_keys(&fx, 512);

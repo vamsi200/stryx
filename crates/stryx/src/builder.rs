@@ -5,7 +5,6 @@ use std::{
     vec,
 };
 
-use anyhow::Context;
 use xorf::{BinaryFuse8, BinaryFuse16, BinaryFuse32};
 
 use crate::{
@@ -17,65 +16,19 @@ use crate::{
     index::IndexBuilder,
 };
 
-#[derive(Debug, Default, Clone)]
+/// A borrowed key-value pair representing a single entry within a block or table.
+#[derive(Debug, Default, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Record<'a> {
+    /// The key component of the record, represented as a borrowed byte slice.
     pub key: &'a [u8],
+
+    /// The value component of the record, represented as a borrowed byte slice.
     pub value: &'a [u8],
 }
 
-pub trait Encode {
+trait Encode {
     fn encode_len(&self) -> usize;
     fn encode_record(&self) -> Result<Vec<u8>, DecodeError>;
-}
-
-pub struct RecordReader<'a> {
-    value: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> RecordReader<'a> {
-    pub fn new(value: &'a [u8]) -> Self {
-        Self { value, pos: 0 }
-    }
-
-    pub fn next_record(&mut self) -> Result<Option<Record<'a>>, DecodeError> {
-        if self.pos == self.value.len() {
-            return Ok(None);
-        }
-
-        let remaining = &self.value[self.pos..];
-
-        if remaining.len() < 6 {
-            return Err(DecodeError::Truncated);
-        }
-
-        let key_len = u16::from_le_bytes([remaining[0], remaining[1]]) as usize;
-        let value_len = u32::from_le_bytes(
-            remaining[2..6]
-                .try_into()
-                .map_err(|_| DecodeError::InvalidLength)?,
-        ) as usize;
-
-        let record_len = 6usize
-            .checked_add(key_len)
-            .and_then(|v| v.checked_add(value_len))
-            .ok_or(DecodeError::InvalidLength)?;
-
-        if remaining.len() < record_len {
-            return Err(DecodeError::Truncated);
-        }
-
-        let key = &remaining[6..6 + key_len];
-        let value = &remaining[6 + key_len..record_len];
-
-        self.pos += record_len;
-
-        Ok(Some(Record { key, value }))
-    }
-
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
 }
 
 impl Encode for Record<'_> {
@@ -86,12 +39,8 @@ impl Encode for Record<'_> {
     fn encode_record(&self) -> Result<Vec<u8>, DecodeError> {
         let mut value = Vec::with_capacity(self.encode_len());
 
-        let key_len = u16::try_from(self.key.len())
-            .context("Key Too Large")
-            .unwrap();
-        let value_len = u32::try_from(self.value.len())
-            .context("Value Too Large")
-            .unwrap();
+        let key_len = u16::try_from(self.key.len()).map_err(|_| DecodeError::KeyTooLarge)?;
+        let value_len = u32::try_from(self.value.len()).map_err(|_| DecodeError::ValueTooLarge)?;
 
         value.write_all(&key_len.to_le_bytes())?;
         value.write_all(&value_len.to_le_bytes())?;
@@ -104,14 +53,14 @@ impl Encode for Record<'_> {
 
 #[repr(u8)]
 #[derive(Debug, PartialEq)]
-pub enum FilterTypeRepr {
+pub(crate) enum FilterTypeRepr {
     None = 0,
     BinaryFuse8 = 1,
     BinaryFuse16 = 2,
     BinaryFuse32 = 3,
 }
 
-pub fn from_filter_type(byte: u8) -> Result<FilterTypeRepr, DecodeError> {
+pub(crate) fn from_filter_type(byte: u8) -> Result<FilterTypeRepr, DecodeError> {
     match byte {
         0 => Ok(FilterTypeRepr::None),
         1 => Ok(FilterTypeRepr::BinaryFuse8),
@@ -120,11 +69,31 @@ pub fn from_filter_type(byte: u8) -> Result<FilterTypeRepr, DecodeError> {
         _ => Err(DecodeError::InvalidFilterType),
     }
 }
-#[derive(Debug)]
+
+/// Represents different variations of probabilistic filters.
+/// `XorFilter` allows to quickly check whether a key
+/// might exist before performing expensive disk or block lookups.
+#[derive(Debug, Clone)]
 pub enum XorFilter {
+    /// No filtering is used; lookups will always query the underlying storage or blocks directly.
     None,
+
+    /// An 8-bit Binary Fuse filter.
+    ///
+    /// Provides the most compact memory footprint among the fuse variants, but has a
+    /// slightly higher false positive rate (typically around 1/256).
     BinaryFuse8(BinaryFuse8),
+
+    /// A 16-bit Binary Fuse filter.
+    ///
+    /// Provides a balanced compromise between memory consumption and a lower
+    /// false positive probability (typically around 1/65,536).
     BinaryFuse16(BinaryFuse16),
+
+    /// A 32-bit Binary Fuse filter.
+    ///
+    /// Provides an extremely low false positive rate at the cost of a larger
+    /// memory footprint per key.
     BinaryFuse32(BinaryFuse32),
 }
 
@@ -133,6 +102,8 @@ pub(crate) struct FilterSection {
     pub checksum: u32,
 }
 
+/// A builder for constructing and encoding an SSTable
+/// to a given write destination.
 #[derive(Debug)]
 pub struct TableBuilder<W: Write> {
     /// Destination for the encoded SSTable
@@ -298,7 +269,16 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         Ok(())
     }
 
-    /// Append a record
+    /// Adds a record to the SSTable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The key exceeds the maximum supported key length.
+    /// - The value exceeds the maximum supported value length.
+    /// - The key violates the configured ordering policy.
+    /// - The key is a duplicate and duplicate handling is set to `Reject`.
+    /// - Writing or encoding the record fails.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), StryxError> {
         if let Some(sorter) = &mut self.sorter {
             sorter.push(key, value)?;
@@ -329,7 +309,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
 
         let encoded_block = match self.options.compression {
             Compression::None => block,
-            Compression::Zstd => zstd::encode_all(block.as_slice(), 1)?,
+            Compression::Zstd(level) => zstd::encode_all(block.as_slice(), level)?,
             Compression::Lz4 => lz4_flex::compress(&block),
         };
 
@@ -339,7 +319,9 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         self.writer.write_all(&encoded_block)?;
 
         self.index.add(
-            self.block_first_key.as_deref().unwrap(),
+            self.block_first_key
+                .as_deref()
+                .ok_or(StryxError::MissingBlockFirstKey)?,
             block_offset,
             block_size,
             uncompressed_block_size,
@@ -354,7 +336,20 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         Ok(())
     }
 
-    /// Append a batch of records
+    /// Appends a batch of records to the SSTable.
+    ///
+    /// Records are processed sequentially using [`Self::add`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if adding any record fails, including:
+    /// - The key or value exceeds the supported size limit.
+    /// - The key violates the configured ordering policy.
+    /// - A duplicate key is encountered under [`DuplicatePolicy::Reject`].
+    /// - Encoding or writing the record fails.
+    ///
+    /// If an error occurs, previously processed records remain appended.
+    /// The remaining records are not processed.
     pub fn add_batch(
         &mut self,
         records: impl IntoIterator<Item = Record<'a>>,
@@ -365,7 +360,7 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
         Ok(())
     }
 
-    /// Flush remaining blocks, write index and footer, finalize file
+    /// Flushes remaining blocks, write index and footer, finalize file
     /// and return the metadata about completed table.
     pub fn finalize(mut self) -> Result<(TableMetadata, WriteStatistics), StryxError> {
         if let Some(sorter) = self.sorter.take() {
@@ -475,10 +470,16 @@ impl<'a, W: std::io::Write> TableBuilder<W> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Performance and progress statistics collected during a table write or build operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteStatistics {
+    /// The total number of key-value records successfully written.
     pub record_count: u64,
+
+    /// The total number of data blocks generated and written.
     pub blocks_written: u32,
+
+    /// The total number of bytes written to the backing writer.
     pub bytes_written: u64,
 }
 
@@ -537,7 +538,8 @@ impl std::fmt::Display for WriteStatistics {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// Metadata of the stryx file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TableMetadata {
     /// Total number of records stored in the table.
     pub record_count: u64,
@@ -579,7 +581,14 @@ impl TableMetadata {
 
     fn encode(&self) -> Result<Vec<u8>, StryxError> {
         let mut out = vec![];
-        out.extend((self.compression as u8).to_le_bytes());
+        match self.compression {
+            Compression::None => out.push(0),
+            Compression::Lz4 => out.push(1),
+            Compression::Zstd(level) => {
+                out.push(2);
+                out.extend(level.to_le_bytes());
+            }
+        }
         out.extend(self.record_count.to_le_bytes());
         out.extend(self.block_count.to_le_bytes());
         out.extend(self.file_size.to_le_bytes());
@@ -599,9 +608,15 @@ impl TableMetadata {
         Ok(out)
     }
 
-    pub fn decode(data: &[u8]) -> Result<TableMetadata, StryxError> {
+    pub(crate) fn decode(data: &[u8]) -> Result<TableMetadata, StryxError> {
         let mut decoder = Decoder::new(data);
-        let compression = decoder.read_u8()?;
+        let compression = match decoder.read_u8()? {
+            0 => Compression::None,
+            1 => Compression::Lz4,
+            2 => Compression::Zstd(decoder.read_i32()?),
+            _ => return Err(StryxError::InvalidCompression),
+        };
+
         let record_count = decoder.read_u64()?;
         let block_count = decoder.read_u32()?;
         let file_size = decoder.read_u64()?;
@@ -611,12 +626,6 @@ impl TableMetadata {
         let max_key = decoder.read_bytes(max_key_size)?;
         let index_offset = decoder.read_u64()?;
         let index_size = decoder.read_u64()?;
-
-        let compression = match compression {
-            1 => Compression::Lz4,
-            2 => Compression::Zstd,
-            _ => Compression::None,
-        };
 
         Ok(TableMetadata {
             compression,
@@ -667,7 +676,7 @@ impl TableMetadata {
 ///
 /// The final 8 bytes contain the record count and checksum.
 #[derive(Debug, Default)]
-pub struct BlockBuilder {
+pub(crate) struct BlockBuilder {
     /// Encoded records
     data: Vec<u8>,
 
@@ -676,12 +685,12 @@ pub struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::default()
     }
 
     /// Append an encoded record
-    pub fn add(&mut self, encoded_record: &[u8]) -> Result<(), StryxError> {
+    fn add(&mut self, encoded_record: &[u8]) -> Result<(), StryxError> {
         let offset = u32::try_from(self.data.len())?;
 
         self.offsets.push(offset);
@@ -690,7 +699,7 @@ impl BlockBuilder {
     }
 
     /// Current encoded block size, including offsets, record count and checksum
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.data.len()
             + self.offsets.len() * size_of::<u32>()
             + size_of::<u32>()
@@ -698,12 +707,12 @@ impl BlockBuilder {
     }
 
     /// Whether the block contains any records
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.offsets.is_empty()
     }
 
     /// Finalize the block into encoded bytes
-    pub fn finish(&mut self) -> Result<Vec<u8>, StryxError> {
+    fn finish(&mut self) -> Result<Vec<u8>, StryxError> {
         for offset in &self.offsets {
             self.data.extend_from_slice(&offset.to_le_bytes());
         }
@@ -718,7 +727,7 @@ impl BlockBuilder {
     }
 
     /// Reset the block while retaining allocated capacity
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.data.clear();
         self.offsets.clear();
     }
@@ -727,6 +736,56 @@ impl BlockBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordReader<'a> {
+        value: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> RecordReader<'a> {
+        fn new(value: &'a [u8]) -> Self {
+            Self { value, pos: 0 }
+        }
+
+        fn next_record(&mut self) -> Result<Option<Record<'a>>, DecodeError> {
+            if self.pos == self.value.len() {
+                return Ok(None);
+            }
+
+            let remaining = &self.value[self.pos..];
+
+            if remaining.len() < 6 {
+                return Err(DecodeError::Truncated);
+            }
+
+            let key_len = u16::from_le_bytes([remaining[0], remaining[1]]) as usize;
+            let value_len = u32::from_le_bytes(
+                remaining[2..6]
+                    .try_into()
+                    .map_err(|_| DecodeError::InvalidLength)?,
+            ) as usize;
+
+            let record_len = 6usize
+                .checked_add(key_len)
+                .and_then(|v| v.checked_add(value_len))
+                .ok_or(DecodeError::InvalidLength)?;
+
+            if remaining.len() < record_len {
+                return Err(DecodeError::Truncated);
+            }
+
+            let key = &remaining[6..6 + key_len];
+            let value = &remaining[6 + key_len..record_len];
+
+            self.pos += record_len;
+
+            Ok(Some(Record { key, value }))
+        }
+
+        fn pos(&self) -> usize {
+            self.pos
+        }
+    }
 
     fn encode_record(key: &[u8], value: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::new();

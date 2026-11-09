@@ -2,6 +2,7 @@
 
 use core::panic;
 use std::assert_matches;
+use std::cell::Cell;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -380,7 +381,7 @@ pub fn random_records(n: usize, sorted: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 fn test_compression() -> TestResult {
     let (keys, values) = random_records(1000, true);
 
-    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd(1)] {
         let path = test_path();
 
         let options = TableOptions {
@@ -1069,7 +1070,7 @@ fn test_filter_disabled() -> TestResult {
 
 #[test]
 fn test_filter_with_compression() -> TestResult {
-    for compression in [Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::Lz4, Compression::Zstd(1)] {
         let path = test_path();
 
         let options = TableOptions {
@@ -1195,7 +1196,7 @@ fn test_range_empty_key_mismatch() -> TestResult {
 
 #[test]
 fn test_combo_compression_and_data_checksum_verification() -> TestResult {
-    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd(1)] {
         let path = test_path();
 
         let options = TableOptions {
@@ -1277,7 +1278,7 @@ fn test_combo_filter_and_duplicate_spanning_blocks() -> TestResult {
 
 #[test]
 fn test_combo_block_size_mixed_large_and_small_records() -> TestResult {
-    for compression in [Compression::None, Compression::Lz4, Compression::Zstd] {
+    for compression in [Compression::None, Compression::Lz4, Compression::Zstd(1)] {
         let path = test_path();
 
         let options = TableOptions {
@@ -1338,7 +1339,7 @@ fn test_combo_curated_option_matrix() -> TestResult {
         ),
         (
             256,
-            Compression::Zstd,
+            Compression::Zstd(1),
             FilterType::BinaryFuse32,
             DuplicatePolicy::Reject,
             KeyOrder::Lexicographic,
@@ -1542,6 +1543,7 @@ fn test_robustness_integer_overflow_in_lengths_and_offsets() -> TestResult {
     std::fs::remove_file(path)?;
     Ok(())
 }
+
 #[test]
 fn test_robustness_invalid_enum_discriminants() -> TestResult {
     let path = test_path();
@@ -1685,4 +1687,133 @@ fn test_robustness_filter_lengths_exceeding_remaining_file_size() -> TestResult 
     std::fs::remove_file(path_no_filter)?;
     std::fs::remove_file(path_with_filter)?;
     Ok(())
+}
+
+fn presorted() -> TableOptions {
+    TableOptions {
+        key_order: KeyOrder::Presorted,
+        filter_type: FilterType::None,
+        ..TableOptions::default()
+    }
+}
+
+struct TempTable(PathBuf);
+
+impl TempTable {
+    fn new(name: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!("stryx-{name}-{}-{id}.stryx", std::process::id())))
+    }
+}
+
+impl Drop for TempTable {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn test_add_batch_error_keeps_earlier_records_and_stops() {
+    let t = TempTable::new("add-batch-error");
+    let mut table = TableBuilder::create(&t.0, presorted()).unwrap();
+
+    let pulled = Cell::new(0usize);
+    let batch = vec![
+        Record {
+            key: b"a",
+            value: b"1",
+        },
+        Record {
+            key: b"b",
+            value: b"2",
+        },
+        Record {
+            key: b"aa",
+            value: b"BAD",
+        }, // sorts before "b": out of order, must fail
+        Record {
+            key: b"c",
+            value: b"3",
+        }, // must not be processed
+        Record {
+            key: b"d",
+            value: b"4",
+        }, // must not be processed
+    ];
+
+    let result = table.add_batch(batch.into_iter().inspect(|_| pulled.set(pulled.get() + 1)));
+
+    assert!(result.is_err(), "an out-of-order key must fail the batch");
+    assert_eq!(
+        pulled.get(),
+        3,
+        "records after the failure must not be pulled or processed"
+    );
+
+    table.finalize().unwrap();
+    let mut reader = TableReader::open(&t.0).unwrap();
+
+    assert_eq!(reader.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(reader.get(b"b").unwrap(), Some(b"2".to_vec()));
+    assert_eq!(reader.get(b"aa").unwrap(), None);
+    assert_eq!(reader.get(b"c").unwrap(), None);
+    assert_eq!(reader.get(b"d").unwrap(), None);
+}
+
+#[test]
+fn test_add_batch_error_on_first_record_appends_nothing() {
+    let t = TempTable::new("add-batch-first");
+    let mut table = TableBuilder::create(&t.0, presorted()).unwrap();
+
+    table.add(b"m", b"existing").unwrap();
+
+    // "a" sorts before the already-added "m", so the very first record fails
+    let batch = vec![
+        Record {
+            key: b"a",
+            value: b"1",
+        },
+        Record {
+            key: b"z",
+            value: b"2",
+        },
+    ];
+    assert!(table.add_batch(batch).is_err());
+
+    table.finalize().unwrap();
+    let mut reader = TableReader::open(&t.0).unwrap();
+
+    assert_eq!(reader.get(b"m").unwrap(), Some(b"existing".to_vec()));
+    assert_eq!(reader.get(b"a").unwrap(), None);
+    assert_eq!(reader.get(b"z").unwrap(), None);
+}
+
+#[test]
+fn test_add_batch_success_appends_all_in_order() {
+    let t = TempTable::new("add-batch-ok");
+    let mut table = TableBuilder::create(&t.0, presorted()).unwrap();
+
+    let batch = vec![
+        Record {
+            key: b"a",
+            value: b"1",
+        },
+        Record {
+            key: b"b",
+            value: b"2",
+        },
+        Record {
+            key: b"c",
+            value: b"3",
+        },
+    ];
+    table.add_batch(batch).unwrap();
+    table.add_batch(Vec::new()).unwrap(); // an empty batch is a no-op
+    table.finalize().unwrap();
+
+    let mut reader = TableReader::open(&t.0).unwrap();
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        assert_eq!(reader.get(k).unwrap(), Some(v.to_vec()));
+    }
 }
