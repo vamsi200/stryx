@@ -191,6 +191,20 @@ impl Index {
     pub(crate) fn partition_point_le(&self, key: &[u8]) -> usize {
         self.partition_point_le_from(0, key)
     }
+
+    #[inline]
+    pub(crate) fn partition_point_lt(&self, key: &[u8]) -> usize {
+        let (mut a, mut b) = (0, self.entries.len());
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if self.first_key(mid) < key {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        a
+    }
 }
 
 /// Sparse index entry identifying a data block within the SSTable.

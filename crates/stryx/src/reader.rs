@@ -806,9 +806,15 @@ impl TableReader {
     pub fn prefix(&mut self, prefix: &[u8]) -> Result<TableIterator<'_>, StryxError> {
         self.readstats.prefix_queries += 1;
 
+        let block_idx = self
+            .shared
+            .index
+            .partition_point_lt(prefix)
+            .saturating_sub(1);
+
         Ok(TableIterator {
             reader: self,
-            block_idx: 0,
+            block_idx,
             record_idx: 0,
             records: Vec::new(),
             start_key: None,
