@@ -171,6 +171,31 @@ A lookup does this:
 3. The block is read (or taken from a cache), decompressed if needed, and checksummed on first use.
 4. A binary search over the offset table finds the record.
 
+## Limitations
+
+### Concurrency
+- **Readers are per-thread handles over shared state.** Lookups take `&mut self`, so a single `TableReader` can't be used from several threads at once. To read in parallel, give each thread its own reader with `clone()`. Clones share the open file, index, filter, metadata and block cache (all behind an `Arc`), and each clone gets its own scratch buffers.
+- **Stats are per reader.** `readstats` is not aggregated across clones, so sum them yourself if you need totals.
+- **The block cache and the "seen" flags are shared between clones.** A block loaded twice by any combination of readers is promoted to the cache. Concurrent readers may each decode the same cold block once before it lands in the cache.
+
+### Read API
+- **Point lookups only.** `get` and `get_many` (plus `get_in_bytes` and `get_many_in_bytes`) are the supported read paths.
+- **Values are always copied out.** Every lookup copies the value into a new allocation, either a `Vec<u8>` or a `Bytes`. There is no zero-copy or borrowed-value API. `get_in_bytes` and `get_many_in_bytes` are convenience wrappers: the `Bytes` they return owns its own allocation and doesn't retain block or cache memory, but producing it is not zero-copy. Cloning or slicing it afterwards is cheap.
+- **`get_many` is all-or-nothing.** The first block error aborts the call and no partial results are returned.
+- **Duplicate keys in `get_many`** are allowed and each gets its own result, but they are looked up independently.
+
+### Integrity
+- **Corruption detection only.** CRCs catch accidental corruption. There is no authentication or tamper resistance, and hardening against malicious files is not a goal yet.
+
+### Filters
+- **Binary fuse filters are probabilistic.** A false positive costs an index search and a block read before the key is found to be absent. `get` and `get_many` never return a wrong value because of it.
+- **The filter is optional.** Without it, every miss goes through the index and block search.
+
+### Format
+- **Immutable files.** Tables are written once. There is no update, delete or append, and no compaction or merge.
+- **Sparse index with one entry per block.** Lookup cost depends on block size. Smaller blocks mean a larger index and cheaper block decodes, and larger blocks mean the opposite. Benchmarks cover 1 KB, 4 KB and 16 KB blocks.
+- **Compression is per table** (None, Lz4 or Zstd), chosen at write time. It can't be mixed across blocks.
+
 ## Building and testing
 
 ```bash
