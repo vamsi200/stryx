@@ -5,7 +5,8 @@ pub mod error;
 pub(crate) mod helper;
 pub(crate) mod index;
 pub mod reader;
-pub(crate) mod tests;
+#[cfg(test)]
+mod tests;
 
 /// Default Block Size (16KiB)
 pub const BLOCK_SIZE: usize = 16 * 1024;

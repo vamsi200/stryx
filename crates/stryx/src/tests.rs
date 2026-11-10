@@ -1,6 +1,3 @@
-#![allow(unused)]
-
-use core::panic;
 use std::assert_matches;
 use std::cell::Cell;
 use std::error::Error;
@@ -10,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use crate::VERSION;
 use crate::builder::{Record, TableBuilder};
 use crate::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
 use crate::error::StryxError;
@@ -398,7 +394,7 @@ fn test_compression() -> TestResult {
             .collect();
 
         let record_count = records.len();
-        table.add_batch(records);
+        table.add_batch(records)?;
         table.finalize()?;
 
         let mut reader = TableReader::open(&path)?;

@@ -89,7 +89,6 @@ fn bench_get(c: &mut Criterion) {
             .filter(|k| reader.get(k).unwrap().is_some())
             .count();
         assert_eq!(hits, keys.len());
-        println!("{:?}", reader.readstats);
 
         group.bench_with_input(BenchmarkId::new("hit", name), &keys, |b, keys| {
             b.iter(|| {

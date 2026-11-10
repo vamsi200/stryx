@@ -29,8 +29,8 @@ use zstd::bulk::Decompressor;
 #[derive(Clone)]
 struct BlockWeighter;
 
-impl Weighter<u32, Arc<Vec<u8>>> for BlockWeighter {
-    fn weight(&self, _idx: &u32, block: &Arc<Vec<u8>>) -> u64 {
+impl Weighter<u32, Arc<[u8]>> for BlockWeighter {
+    fn weight(&self, _idx: &u32, block: &Arc<[u8]>) -> u64 {
         block.len() as u64
     }
 }
@@ -41,7 +41,7 @@ impl Weighter<u32, Arc<Vec<u8>>> for BlockWeighter {
 /// the `quick_cache` crate, designed to reduce expensive disk or network reads by
 /// keeping hot blocks in memory.
 #[derive(Debug)]
-pub struct BlockCache(quick_cache::sync::Cache<u32, Arc<Vec<u8>>, BlockWeighter>);
+pub struct BlockCache(quick_cache::sync::Cache<u32, Arc<[u8]>, BlockWeighter>);
 
 impl BlockCache {
     /// Creates a new `BlockCache` configured with a maximum memory limit in bytes.
@@ -63,12 +63,12 @@ impl BlockCache {
     }
 
     #[inline]
-    pub(crate) fn get(&self, idx: &u32) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn get(&self, idx: &u32) -> Option<Arc<[u8]>> {
         self.0.get(idx)
     }
 
     #[inline]
-    pub(crate) fn insert(&self, idx: u32, block: Arc<Vec<u8>>) {
+    pub(crate) fn insert(&self, idx: u32, block: Arc<[u8]>) {
         self.0.insert(idx, block);
     }
 }
@@ -79,8 +79,8 @@ struct BlockDecoder {
 }
 
 impl Debug for BlockDecoder {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockDecoder").finish_non_exhaustive()
     }
 }
 
@@ -575,14 +575,14 @@ impl TableReader {
                     self.readstats.cache_misses += 1;
                 }
 
-                self.load_block(idx)?;
+                self.load_block(idx).map_err(|e| self.count_err(e))?;
 
                 // insert only on the SECOND load of a block, so one-shot blocks
                 // never pay for the allocation, the copy or the insert
                 if let Some(cache) = &self.shared.block_cache
                     && self.shared.block_seen[idx].swap(true, Ordering::Relaxed)
                 {
-                    cache.insert(idx as u32, Arc::from(self.loaded_block().to_vec()));
+                    cache.insert(idx as u32, Arc::from(self.loaded_block()));
                 }
 
                 Self::search_block(self.loaded_block(), key)
@@ -608,7 +608,34 @@ impl TableReader {
         Ok(self.get(key)?.is_some())
     }
 
-    /// Batch point lookups.
+    #[inline]
+    fn count_err(&mut self, e: StryxError) -> StryxError {
+        if matches!(e, StryxError::InvalidChecksum) {
+            self.readstats.checksum_failures += 1;
+        }
+        e
+    }
+
+    /// Looks up several keys in one call and returns their values in the same
+    /// order as `keys`.
+    ///
+    /// The result has one entry per input key: `Some(value)` if the key is
+    /// present, `None` otherwise. Each found value is copied out of its decoded
+    /// block into its own `Vec<u8>`.
+    ///
+    /// Internally the keys are visited in sorted order, so keys that fall in the
+    /// same block share a single block load (and a single cache lookup), and the
+    /// index search only moves forward. This makes it cheaper than calling
+    /// [`get`](Self::get) in a loop, especially when the keys are clustered or
+    /// already sorted. Results are still returned in the caller's original order.
+    /// Duplicate keys are allowed and each gets its own result.
+    ///
+    /// An empty `keys` slice returns an empty `Vec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any block cannot be read or decompressed, or if its
+    /// checksum verification fails. No partial results are returned on error.
     pub fn get_many(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, StryxError> {
         if keys.len() == 1 {
             return Ok(vec![self.get(keys[0])?]);
@@ -623,7 +650,7 @@ impl TableReader {
         }
 
         let mut cur_block: Option<usize> = None;
-        let mut cur_arc: Option<Arc<Vec<u8>>> = None;
+        let mut cur_arc: Option<Arc<[u8]>> = None;
         let mut search_from = 0;
 
         for i in 0..self.order.len() {
@@ -661,10 +688,12 @@ impl TableReader {
                         self.readstats.cache_misses += 1;
                     }
 
-                    self.load_block(idx)?;
+                    self.load_block(idx).map_err(|e| self.count_err(e))?;
 
-                    if let Some(cache) = &self.shared.block_cache {
-                        let arc: Arc<Vec<u8>> = Arc::from(self.loaded_block().to_vec());
+                    if let Some(cache) = &self.shared.block_cache
+                        && self.shared.block_seen[idx].swap(true, Ordering::Relaxed)
+                    {
+                        let arc: Arc<[u8]> = Arc::from(self.loaded_block());
                         cache.insert(idx as u32, Arc::clone(&arc));
                         cur_arc = Some(arc);
                     }
@@ -677,8 +706,9 @@ impl TableReader {
                     Some(a) => a,
                     None => self.loaded_block(),
                 };
-                Self::search_block(block, key)?
-            };
+                Self::search_block(block, key)
+            }
+            .map_err(|e| self.count_err(e))?;
 
             match found {
                 Some(v) => {
@@ -692,14 +722,47 @@ impl TableReader {
         Ok(results)
     }
 
-    #[allow(unused)]
+    /// Looks up `key` and returns its value as an owned [`Bytes`].
+    ///
+    /// The value is copied once out of the decoded block, so the returned
+    /// `Bytes` owns its own allocation. It never borrows from, or keeps alive,
+    /// the reader's scratch buffer or a cached block. This is not a zero-copy
+    /// API: the benefit is downstream. Cloning or slicing the returned `Bytes`
+    /// is a refcount bump, so it can be handed to other threads or consumers
+    /// without further copies.
+    ///
+    /// Returns `Ok(None)` if the key is not present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block cannot be read or decompressed, or if its
+    /// checksum verification fails.
     pub fn get_in_bytes(&mut self, key: &[u8]) -> Result<Option<Bytes>, StryxError> {
-        Err(StryxError::NotImplemented)
+        Ok(self.get(key)?.map(Bytes::from))
     }
 
-    #[allow(unused)]
+    /// Looks up several keys and returns their values as owned [`Bytes`], in
+    /// the same order as `keys`.
+    ///
+    /// Each found value is copied once out of its decoded block, so every
+    /// returned `Bytes` owns a separate allocation and does not retain block or
+    /// cache memory. Keys are processed in sorted order internally so each
+    /// block is loaded at most once per call, but the results are returned in
+    /// the caller's original order. Keys that are not present yield `None`.
+    ///
+    /// This is not a zero-copy API. Cloning or slicing the returned `Bytes`
+    /// values is cheap (a refcount bump), which is the intended benefit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any block cannot be read or decompressed, or if its
+    /// checksum verification fails. No partial results are returned on error.
     pub fn get_many_in_bytes(&mut self, keys: &[&[u8]]) -> Result<Vec<Option<Bytes>>, StryxError> {
-        Err(StryxError::NotImplemented)
+        Ok(self
+            .get_many(keys)?
+            .into_iter()
+            .map(|o| o.map(Bytes::from))
+            .collect())
     }
 
     /// Iterate over all records in sorted order.
@@ -769,6 +832,12 @@ impl TableReader {
     fn search_block(block: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
         let reader = BlockReader::new(block)?;
         Ok(reader.get(key)?.map(|(v, _)| v.to_vec()))
+    }
+
+    #[allow(unused)]
+    fn search_block_ref<'a>(block: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>, StryxError> {
+        let reader = BlockReader::new(block)?;
+        Ok(reader.get(key)?.map(|(v, _)| v))
     }
 
     fn load_block(&mut self, idx: usize) -> Result<(), StryxError> {
