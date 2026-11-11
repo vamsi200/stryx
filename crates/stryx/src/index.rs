@@ -1,4 +1,4 @@
-use crate::{decoder::Decoder, error::StryxError};
+use crate::{decoder::Decoder, error::StryxError, reader::key_lt};
 use std::cmp::Ordering;
 
 #[derive(Debug)]
@@ -173,12 +173,16 @@ impl Index {
 
         // smaller prefix => strictly smaller key; equal prefix => needs a real compare
         let lo = start + pre[start..].partition_point(|&p| p < kp);
-        let hi = lo + pre[lo..].partition_point(|&p| p == kp);
+        let hi = if lo < n && pre[lo] == kp {
+            lo + pre[lo..].partition_point(|&p| p == kp)
+        } else {
+            lo // no entry shares the prefix, so nothing needs a real compare
+        };
 
         let (mut a, mut b) = (lo, hi);
         while a < b {
             let mid = a + (b - a) / 2;
-            if self.first_key(mid) <= key {
+            if !key_lt(key, self.first_key(mid)) {
                 a = mid + 1;
             } else {
                 b = mid;
@@ -197,7 +201,7 @@ impl Index {
         let (mut a, mut b) = (0, self.entries.len());
         while a < b {
             let mid = a + (b - a) / 2;
-            if self.first_key(mid) < key {
+            if key_lt(self.first_key(mid), key) {
                 a = mid + 1;
             } else {
                 b = mid;

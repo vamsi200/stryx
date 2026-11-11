@@ -1,3 +1,4 @@
+#![allow(unused)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -204,7 +205,6 @@ fn bench_get_by_options(c: &mut Criterion) {
                 .filter(|k| reader.get(k).unwrap().is_some())
                 .count();
             assert_eq!(hits, keys.len());
-            println!("{:?}", reader.readstats);
 
             group.throughput(Throughput::Elements(keys.len() as u64));
             group.bench_with_input(

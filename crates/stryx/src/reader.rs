@@ -4,14 +4,12 @@ use std::{
     io::{Read, Seek},
     os::unix::fs::FileExt,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     vec,
 };
 
 use bytes::Bytes;
+use memmap2::{Mmap, MmapOptions};
 use quick_cache::Weighter;
 use xorf::Filter;
 
@@ -132,32 +130,25 @@ pub(crate) struct BlockReader<'a> {
 }
 
 impl<'a> BlockReader<'a> {
+    #[inline]
     fn new(buf: &'a [u8]) -> Result<Self, StryxError> {
-        if buf.len() < 8 {
+        let Some(footer_start) = buf.len().checked_sub(8) else {
             return Err(DecodeError::InvalidLength.into());
-        }
+        };
 
-        let buf_len = buf.len();
+        let record_count =
+            u32::from_le_bytes(buf[footer_start..footer_start + 4].try_into().unwrap()) as usize;
 
-        let record_count = u32::from_le_bytes(
-            buf[buf_len - 8..buf_len - 4]
-                .try_into()
-                .map_err(DecodeError::from)?,
-        ) as usize;
+        // Cannot overflow on 64-bit since record_count <= u32::MAX
+        let table_len = record_count * size_of::<u32>();
 
-        // offset table_len = record_count * size_of::<u32>()
-        let table_len = record_count
-            .checked_mul(size_of::<u32>())
-            .ok_or(DecodeError::InvalidLength)?;
-
-        // buf_len - 8 is where offset table ends (last 8 are record_count and checksum)
-        let records_end = (buf_len - 8)
-            .checked_sub(table_len)
-            .ok_or(DecodeError::InvalidLength)?;
+        let Some(records_end) = footer_start.checked_sub(table_len) else {
+            return Err(DecodeError::InvalidLength.into());
+        };
 
         Ok(Self {
             buf: &buf[..records_end],
-            offsets: &buf[records_end..buf_len - 8],
+            offsets: &buf[records_end..footer_start],
             record_count,
         })
     }
@@ -217,44 +208,98 @@ impl<'a> BlockReader<'a> {
         Ok(())
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
+    fn err_truncated<T>() -> Result<T, StryxError> {
+        Err(DecodeError::Truncated.into())
+    }
+
+    #[inline(always)]
     fn key_at(&self, offset: usize) -> Result<&'a [u8], StryxError> {
-        let header = self
-            .buf
-            .get(offset..offset + 2)
-            .ok_or(DecodeError::Truncated)?;
-        let key_len = u16::from_le_bytes([header[0], header[1]]) as usize;
-        let key_start = offset + 6;
-        self.buf
-            .get(key_start..key_start + key_len)
-            .ok_or_else(|| DecodeError::Truncated.into())
+        let Some(rem) = self.buf.get(offset..) else {
+            return Self::err_truncated();
+        };
+        if rem.len() < 6 {
+            return Self::err_truncated();
+        }
+        let key_len = u16::from_le_bytes([rem[0], rem[1]]) as usize;
+        let key_end = 6 + key_len; // Cannot overflow: 6 + u16::MAX == 65541
+        if rem.len() < key_end {
+            return Self::err_truncated();
+        }
+        Ok(&rem[6..key_end])
     }
 
     // binary search the key
     fn get(&self, key: &[u8]) -> Result<Option<(&'a [u8], u32)>, StryxError> {
         let (mut lo, mut hi) = (0usize, self.record_count);
+        let mut matched_off: Option<usize> = None;
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let offset = self.offset(mid);
+            let off = self.offset(mid);
+            let k = self.key_at(off)?;
 
-            // ONLY parse the key, don't waste time checking value lengths/bounds
-            let k = self.key_at(offset)?;
-
-            if k < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+            match key_cmp(k, key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    // Fast path: if `mid == lo` or the previous key is `< key`,
+                    // `mid` is guaranteed to be the FIRST matching record!
+                    if mid == lo {
+                        return Ok(Some((self.value_at(off, key.len())?, off as u32)));
+                    }
+                    let prev_off = self.offset(mid - 1);
+                    if key_lt(self.key_at(prev_off)?, key) {
+                        return Ok(Some((self.value_at(off, key.len())?, off as u32)));
+                    }
+                    // Previous key was ALSO == key!
+                    // Now we know both `mid` and `mid - 1` match `key`.
+                    matched_off = Some(prev_off);
+                    hi = mid - 1;
+                    break;
+                }
             }
         }
 
-        if lo == self.record_count {
-            return Ok(None);
+        // Only reached if `mid` AND `mid - 1` were both duplicates of `key`.
+        // Every key in `lo..hi` is guaranteed `<= key`, so we only check `< key` vs `== key`!
+        if let Some(mut first_off) = matched_off {
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let off = self.offset(mid);
+                let k = self.key_at(off)?;
+                if key_lt(k, key) {
+                    lo = mid + 1;
+                } else {
+                    first_off = off;
+                    hi = mid;
+                }
+            }
+            return Ok(Some((
+                self.value_at(first_off, key.len())?,
+                first_off as u32,
+            )));
         }
 
-        let off = self.offset(lo);
-        let (k, v) = self.record_at(off)?;
-        Ok((k == key).then_some((v, off as u32)))
+        Ok(None)
+    }
+
+    #[inline(always)]
+    fn value_at(&self, off: usize, key_len: usize) -> Result<&'a [u8], StryxError> {
+        let Some(rem) = self.buf.get(off..) else {
+            return Self::err_truncated();
+        };
+        if rem.len() < 6 {
+            return Self::err_truncated();
+        }
+        let vlen = u32::from_le_bytes([rem[2], rem[3], rem[4], rem[5]]) as usize;
+        let val_start = 6 + key_len;
+        let val_end = val_start + vlen; // Safe on 64-bit: 6 + u16::MAX + u32::MAX < usize::MAX
+        let Some(val) = rem.get(val_start..val_end) else {
+            return Self::err_truncated();
+        };
+        Ok(val)
     }
 
     fn records(&self) -> Result<Vec<Record<'a>>, StryxError> {
@@ -265,6 +310,61 @@ impl<'a> BlockReader<'a> {
             })
             .collect()
     }
+}
+
+#[inline(always)]
+pub(crate) fn key_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let n = a.len().min(b.len());
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+
+    // SAFETY: `n <= a.len()` and `n <= b.len()` by definition of `min`.
+    // All reads below are at offsets `<= n - width`.
+    unsafe {
+        if n >= 8 {
+            let mut i = 0;
+            while i + 8 <= n {
+                let x = ap.add(i).cast::<u64>().read_unaligned().to_be();
+                let y = bp.add(i).cast::<u64>().read_unaligned().to_be();
+                if x != y {
+                    return x.cmp(&y);
+                }
+                i += 8;
+            }
+            let x = ap.add(n - 8).cast::<u64>().read_unaligned().to_be();
+            let y = bp.add(n - 8).cast::<u64>().read_unaligned().to_be();
+            if x != y {
+                return x.cmp(&y);
+            }
+        } else if n >= 4 {
+            let x1 = ap.cast::<u32>().read_unaligned().to_be();
+            let y1 = bp.cast::<u32>().read_unaligned().to_be();
+            if x1 != y1 {
+                return x1.cmp(&y1);
+            }
+            let x2 = ap.add(n - 4).cast::<u32>().read_unaligned().to_be();
+            let y2 = bp.add(n - 4).cast::<u32>().read_unaligned().to_be();
+            if x2 != y2 {
+                return x2.cmp(&y2);
+            }
+        } else {
+            let mut i = 0;
+            while i < n {
+                let x = *ap.add(i);
+                let y = *bp.add(i);
+                if x != y {
+                    return x.cmp(&y);
+                }
+                i += 1;
+            }
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+#[inline(always)]
+pub(crate) fn key_lt(a: &[u8], b: &[u8]) -> bool {
+    key_cmp(a, b) == std::cmp::Ordering::Less
 }
 
 /// Configuration options for controlling the behavior and performance of the reader.
@@ -299,6 +399,7 @@ pub(crate) struct SharedTable {
     filter: XorFilter,
     block_cache: Option<BlockCache>,
     block_seen: Vec<AtomicBool>,
+    mmaped_file: Mmap,
 }
 
 /// A reader responsible for efficiently traversing, decoding, and reading blocks
@@ -319,6 +420,8 @@ pub struct TableReader {
     order: Vec<usize>,
 
     loaded_idx: Option<usize>,
+
+    last_hit: Option<(usize, Arc<[u8]>)>,
 }
 
 /// Cloning the reader creates a new scratchpad for a new thread,
@@ -332,6 +435,7 @@ impl Clone for TableReader {
             block_decoder: BlockDecoder::new(),
             order: Vec::new(),
             loaded_idx: None,
+            last_hit: None,
         }
     }
 }
@@ -493,6 +597,9 @@ impl TableReader {
 
         index.build_prefixes();
 
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let _ = mmap.advise(memmap2::Advice::Random);
+
         let share_table = Arc::new(SharedTable {
             file,
             index,
@@ -502,6 +609,7 @@ impl TableReader {
             filter,
             block_cache: reader_options.block_cache,
             block_seen: seen,
+            mmaped_file: mmap,
         });
 
         Ok(TableReader {
@@ -511,6 +619,7 @@ impl TableReader {
             block_decoder: BlockDecoder::new(),
             order: Vec::new(),
             loaded_idx: None,
+            last_hit: None,
         })
     }
 
@@ -523,6 +632,24 @@ impl TableReader {
             XorFilter::BinaryFuse32(bf) => bf.contains(&key_hash),
             _ => true,
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn verify_block_once(
+        shared: &SharedTable,
+        readstats: &mut ReadStats,
+        idx: usize,
+        data: &[u8],
+    ) -> Result<(), StryxError> {
+        if let Err(e) = BlockReader::verify_checksum(data) {
+            if matches!(e, StryxError::InvalidChecksum) {
+                readstats.checksum_failures += 1;
+            }
+            return Err(e);
+        }
+        shared.crc_verification[idx].store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Retrieves the value associated with the given key.
@@ -556,11 +683,43 @@ impl TableReader {
         // the requested key `could be` in previous one
         let idx = block - 1;
 
-        let result = if self.loaded_idx == Some(idx) {
-            // same block as the previous lookup, the scratch still holds the block
+        let result = if matches!(self.shared.metadata.compression, Compression::None) {
+            let e = &self.shared.index.entries[idx];
+            let start = e.offset as usize;
+            let size = e.size as usize;
+
+            let Some(data) = self.shared.mmaped_file.get(start..start + size) else {
+                return Err(self.count_err(DecodeError::Truncated.into()));
+            };
+
+            if self.loaded_idx != Some(idx) {
+                self.readstats.blocks_read += 1;
+                self.readstats.bytes_read += size as u64;
+
+                if !self.shared.disable_block_verification
+                    && !self.shared.crc_verification[idx].load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Err(e) =
+                        Self::verify_block_once(&self.shared, &mut self.readstats, idx, data)
+                    {
+                        return Err(self.count_err(e));
+                    }
+                }
+                self.loaded_idx = Some(idx);
+            }
+
+            Self::search_block(data, key)
+        } else if self.loaded_idx == Some(idx) {
+            // Same compressed block as previous uncached lookup
             Self::search_block(self.loaded_block(), key)
+        } else if let Some((i, block)) = &self.last_hit
+            && *i == idx
+        {
+            // Same compressed block as previous cached lookup (skips BlockCache hash/lock)
+            self.readstats.cache_hits += 1;
+            Self::search_block(block, key)
         } else {
-            // check cache first: a hit skips read, decompress and CRC
+            // Check shared BlockCache first: a hit skips decompress and CRC
             let cached = self
                 .shared
                 .block_cache
@@ -569,7 +728,9 @@ impl TableReader {
 
             if let Some(data) = cached {
                 self.readstats.cache_hits += 1;
-                Self::search_block(&data, key)
+                let res = Self::search_block(&data, key);
+                self.last_hit = Some((idx, data));
+                res
             } else {
                 if self.shared.block_cache.is_some() {
                     self.readstats.cache_misses += 1;
@@ -577,18 +738,18 @@ impl TableReader {
 
                 self.load_block(idx).map_err(|e| self.count_err(e))?;
 
-                // insert only on the SECOND load of a block, so one-shot blocks
-                // never pay for the allocation, the copy or the insert
+                // Insert only on the SECOND load of a block
                 if let Some(cache) = &self.shared.block_cache
-                    && self.shared.block_seen[idx].swap(true, Ordering::Relaxed)
+                    && self.shared.block_seen[idx].swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
-                    cache.insert(idx as u32, Arc::from(self.loaded_block()));
+                    let arc_block: Arc<[u8]> = Arc::from(self.loaded_block());
+                    cache.insert(idx as u32, Arc::clone(&arc_block));
+                    self.last_hit = Some((idx, arc_block));
                 }
 
                 Self::search_block(self.loaded_block(), key)
             }
         };
-
         let result = result.map_err(|e| {
             if matches!(e, StryxError::InvalidChecksum) {
                 self.readstats.checksum_failures += 1;
@@ -608,7 +769,8 @@ impl TableReader {
         Ok(self.get(key)?.is_some())
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
     fn count_err(&mut self, e: StryxError) -> StryxError {
         if matches!(e, StryxError::InvalidChecksum) {
             self.readstats.checksum_failures += 1;
@@ -691,7 +853,8 @@ impl TableReader {
                     self.load_block(idx).map_err(|e| self.count_err(e))?;
 
                     if let Some(cache) = &self.shared.block_cache
-                        && self.shared.block_seen[idx].swap(true, Ordering::Relaxed)
+                        && self.shared.block_seen[idx]
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
                         let arc: Arc<[u8]> = Arc::from(self.loaded_block());
                         cache.insert(idx as u32, Arc::clone(&arc));
@@ -849,27 +1012,24 @@ impl TableReader {
     fn load_block(&mut self, idx: usize) -> Result<(), StryxError> {
         self.loaded_idx = None;
 
-        let (offset, size, uncompressed_size) = {
-            let e = &self.shared.index.entries[idx];
-            (e.offset, e.size, e.uncompressed_block_size)
-        };
+        let e = &self.shared.index.entries[idx];
+        let start = e.offset as usize;
+        let size = e.size as usize;
+        let uncompressed_size = e.uncompressed_block_size as usize;
 
-        self.block_buf.resize(size as usize, 0);
-        self.shared
-            .file
-            .read_exact_at(&mut self.block_buf, offset)?;
+        let raw = self
+            .shared
+            .mmaped_file
+            .get(start..start + size)
+            .ok_or(DecodeError::Truncated)?;
 
         self.readstats.blocks_read += 1;
-        self.readstats.bytes_read += u64::from(size);
+        self.readstats.bytes_read += size as u64;
 
         let (data, decompressed): (&[u8], bool) = match self.shared.metadata.compression {
-            Compression::Zstd(_) => self
-                .block_decoder
-                .zstd(&self.block_buf, uncompressed_size as usize)?,
-            Compression::Lz4 => self
-                .block_decoder
-                .lz4(&self.block_buf, uncompressed_size as usize)?,
-            Compression::None => (self.block_buf.as_slice(), false),
+            Compression::Zstd(_) => self.block_decoder.zstd(raw, uncompressed_size)?,
+            Compression::Lz4 => self.block_decoder.lz4(raw, uncompressed_size)?,
+            Compression::None => (raw, false),
         };
 
         if decompressed {
@@ -878,15 +1038,9 @@ impl TableReader {
         }
 
         if !self.shared.disable_block_verification
-            && !self.shared.crc_verification[idx].load(Ordering::Relaxed)
+            && !self.shared.crc_verification[idx].load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Err(e) = BlockReader::verify_checksum(data) {
-                if matches!(e, StryxError::InvalidChecksum) {
-                    self.readstats.checksum_failures += 1;
-                }
-                return Err(e);
-            }
-            self.shared.crc_verification[idx].store(true, Ordering::Relaxed);
+            Self::verify_block_once(&self.shared, &mut self.readstats, idx, data)?;
         }
 
         self.loaded_idx = Some(idx);
@@ -894,10 +1048,16 @@ impl TableReader {
         Ok(())
     }
 
+    #[inline(always)]
     fn loaded_block(&self) -> &[u8] {
         match self.shared.metadata.compression {
-            Compression::None => &self.block_buf,
-            Compression::Zstd(_) | Compression::Lz4 => self.block_decoder.out(),
+            Compression::None => {
+                let idx = self.loaded_idx.expect("block must be loaded");
+                let e = &self.shared.index.entries[idx];
+                let start = e.offset as usize;
+                &self.shared.mmaped_file[start..start + e.size as usize]
+            }
+            Compression::Zstd(_) | Compression::Lz4 => &self.block_decoder.out(),
         }
     }
 }

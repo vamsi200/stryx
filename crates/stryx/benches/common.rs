@@ -150,3 +150,109 @@ where
         start.elapsed()
     })
 }
+
+#[derive(Clone, Copy, Debug)]
+pub enum Shape {
+    Short,
+    LongPrefix,
+    Tied,
+    Random,
+    VarLen,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Values {
+    Compressible,
+    Random,
+}
+
+#[derive(Clone)]
+pub struct Spec {
+    pub shape: Shape,
+    pub value_len: usize,
+    pub values: Values,
+    pub compression: Compression,
+    pub block_size: usize,
+    pub filter: FilterType,
+}
+
+pub const TARGET_BYTES: usize = 16 << 20;
+
+fn splitmix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+pub fn make_key(shape: Shape, i: usize) -> Vec<u8> {
+    match shape {
+        Shape::Short => {
+            let mut k = format!("key-{i:010}-").into_bytes();
+            k.resize(16, b'x');
+            k
+        }
+        Shape::LongPrefix => {
+            let mut k = format!("tenant-0042/collection-17/records/doc-{i:010}").into_bytes();
+            k.resize(64, b'x');
+            k
+        }
+        Shape::Tied => format!("tenant-{:04}/{i:010}", i / 5000).into_bytes(),
+        Shape::Random => {
+            let mut k = splitmix(i as u64).to_be_bytes().to_vec();
+            k.extend_from_slice(&splitmix(!(i as u64)).to_be_bytes());
+            k
+        }
+        // 10..=41 bytes
+        Shape::VarLen => {
+            let mut k = format!("k{i:09}").into_bytes();
+            k.extend(std::iter::repeat_n(b'v', i % 32));
+            k
+        }
+    }
+}
+
+pub fn build_spec(s: Spec) -> Table {
+    let klen = make_key(s.shape, 0).len();
+    let n = (TARGET_BYTES / (klen + s.value_len)).clamp(2_000, 500_000);
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("bench-stryx-{}-{id}.stryx", std::process::id()));
+    let options = TableOptions {
+        compression: s.compression,
+        filter_type: s.filter,
+        block_size: s.block_size,
+        key_order: KeyOrder::Presorted,
+        duplicate_policy: DuplicatePolicy::Reject,
+        ..TableOptions::default()
+    };
+    let mut table = TableBuilder::create(&path, options).unwrap();
+
+    let mut keys: Vec<Vec<u8>> = (0..n).map(|i| make_key(s.shape, i)).collect();
+    keys.sort_unstable();
+
+    let mut v = vec![0u8; s.value_len];
+    for (i, key) in keys.iter().enumerate() {
+        match s.values {
+            Values::Compressible => {
+                let head = format!("value-{i:010}-");
+                v.fill(b'p');
+                let m = head.len().min(v.len());
+                v[..m].copy_from_slice(&head.as_bytes()[..m]);
+            }
+            Values::Random => {
+                for (j, b) in v.iter_mut().enumerate() {
+                    *b = splitmix((i * 31 + j / 8) as u64).to_le_bytes()[j % 8];
+                }
+            }
+        }
+        table.add(key, &v).unwrap();
+    }
+    table.finalize().unwrap();
+
+    Table {
+        path,
+        keys,
+        value_len: s.value_len,
+    }
+}
