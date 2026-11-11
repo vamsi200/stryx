@@ -112,4 +112,7 @@ pub enum StryxError {
     /// The provided or stored data is invalid.
     #[error("{0}")]
     InvalidData(&'static str),
+
+    #[error("Invalid Offset")]
+    InvalidOffset,
 }

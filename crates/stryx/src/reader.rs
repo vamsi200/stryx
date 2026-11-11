@@ -230,30 +230,39 @@ impl<'a> BlockReader<'a> {
         Ok(&rem[6..key_end])
     }
 
-    // binary search the key
-    fn get(&self, key: &[u8]) -> Result<Option<(&'a [u8], u32)>, StryxError> {
+    // binary search the key, skipping `skip` already-verified shared prefix bytes
+    #[inline(always)]
+    fn get(&self, key: &[u8], skip: usize) -> Result<Option<(&'a [u8], u32)>, StryxError> {
         let (mut lo, mut hi) = (0usize, self.record_count);
         let mut matched_off: Option<usize> = None;
+        let key_sfx = &key[skip..];
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let off = self.offset(mid);
             let k = self.key_at(off)?;
+            let Some(k_sfx) = k.get(skip..) else {
+                return Self::err_truncated();
+            };
 
-            match key_cmp(k, key) {
+            match key_cmp(k_sfx, key_sfx) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    // Fast path: if `mid == lo` or the previous key is `< key`,
-                    // `mid` is guaranteed to be the FIRST matching record!
+                    // if `mid == lo` or the previous key is `< key`,
+                    // `mid` is guaranteed to be the FIRST matching record
                     if mid == lo {
                         return Ok(Some((self.value_at(off, key.len())?, off as u32)));
                     }
                     let prev_off = self.offset(mid - 1);
-                    if key_lt(self.key_at(prev_off)?, key) {
+                    let prev_k = self.key_at(prev_off)?;
+                    let Some(prev_sfx) = prev_k.get(skip..) else {
+                        return Self::err_truncated();
+                    };
+                    if key_lt(prev_sfx, key_sfx) {
                         return Ok(Some((self.value_at(off, key.len())?, off as u32)));
                     }
-                    // Previous key was ALSO == key!
+                    // Previous key was also == key!
                     // Now we know both `mid` and `mid - 1` match `key`.
                     matched_off = Some(prev_off);
                     hi = mid - 1;
@@ -269,7 +278,10 @@ impl<'a> BlockReader<'a> {
                 let mid = lo + (hi - lo) / 2;
                 let off = self.offset(mid);
                 let k = self.key_at(off)?;
-                if key_lt(k, key) {
+                let Some(k_sfx) = k.get(skip..) else {
+                    return Self::err_truncated();
+                };
+                if key_lt(k_sfx, key_sfx) {
                     lo = mid + 1;
                 } else {
                     first_off = off;
@@ -391,7 +403,6 @@ pub struct ReaderOptions {
 
 #[derive(Debug)]
 pub(crate) struct SharedTable {
-    file: std::fs::File,
     index: Index,
     metadata: TableMetadata,
     disable_block_verification: bool,
@@ -601,7 +612,6 @@ impl TableReader {
         let _ = mmap.advise(memmap2::Advice::Random);
 
         let share_table = Arc::new(SharedTable {
-            file,
             index,
             metadata,
             disable_block_verification: reader_options.disable_block_verification,
@@ -652,18 +662,25 @@ impl TableReader {
         Ok(())
     }
 
-    /// Retrieves the value associated with the given key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Reading the underlying SSTable fails.
-    /// - A data block is corrupted.
-    /// - Checksum verification fails.
-    /// - Block decompression or decoding fails.
-    ///
-    /// Returns `Ok(None)` if the key does not exist.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
+    #[inline(always)]
+    fn search_block(block: &[u8], key: &[u8], skip: usize) -> Result<Option<Vec<u8>>, StryxError> {
+        let reader = BlockReader::new(block)?;
+        Ok(reader.get(key, skip)?.map(|(v, _)| v.to_vec()))
+    }
+
+    #[inline(always)]
+    fn search_block_slice<'a>(
+        block: &'a [u8],
+        key: &[u8],
+        skip: usize,
+    ) -> Result<Option<&'a [u8]>, StryxError> {
+        let reader = BlockReader::new(block)?;
+        Ok(reader.get(key, skip)?.map(|(v, _)| v))
+    }
+
+    // Zero-allocation lookup returning a borrowed slice directly from the mmap,
+    // block cache or decompression buffer.
+    pub fn get_ref(&mut self, key: &[u8]) -> Result<Option<&[u8]>, StryxError> {
         if !self.xorf_contains(key) {
             self.readstats.point_misses += 1;
             return Ok(None);
@@ -683,7 +700,14 @@ impl TableReader {
         // the requested key `could be` in previous one
         let idx = block - 1;
 
-        let result = if matches!(self.shared.metadata.compression, Compression::None) {
+        let skip = if block < self.shared.index.entries.len() {
+            self.shared.index.lcp_len
+        } else {
+            0
+        };
+
+        // Prepare the block and record whether it lives in self.last_hit
+        let use_last_hit = if matches!(self.shared.metadata.compression, Compression::None) {
             let e = &self.shared.index.entries[idx];
             let start = e.offset as usize;
             let size = e.size as usize;
@@ -707,19 +731,16 @@ impl TableReader {
                 }
                 self.loaded_idx = Some(idx);
             }
-
-            Self::search_block(data, key)
+            false
         } else if self.loaded_idx == Some(idx) {
-            // Same compressed block as previous uncached lookup
-            Self::search_block(self.loaded_block(), key)
-        } else if let Some((i, block)) = &self.last_hit
-            && *i == idx
-        {
-            // Same compressed block as previous cached lookup (skips BlockCache hash/lock)
+            // same compressed block as previous uncached lookup
+            false
+        } else if matches!(&self.last_hit, Some((i, _)) if *i == idx) {
+            // same compressed block as previous cached lookup (skips BlockCache hash/lock)
             self.readstats.cache_hits += 1;
-            Self::search_block(block, key)
+            true
         } else {
-            // Check shared BlockCache first: a hit skips decompress and CRC
+            // check shared BlockCache first: a hit skips decompress and CRC
             let cached = self
                 .shared
                 .block_cache
@@ -728,9 +749,8 @@ impl TableReader {
 
             if let Some(data) = cached {
                 self.readstats.cache_hits += 1;
-                let res = Self::search_block(&data, key);
                 self.last_hit = Some((idx, data));
-                res
+                true
             } else {
                 if self.shared.block_cache.is_some() {
                     self.readstats.cache_misses += 1;
@@ -746,22 +766,64 @@ impl TableReader {
                     cache.insert(idx as u32, Arc::clone(&arc_block));
                     self.last_hit = Some((idx, arc_block));
                 }
-
-                Self::search_block(self.loaded_block(), key)
+                false
             }
         };
-        let result = result.map_err(|e| {
-            if matches!(e, StryxError::InvalidChecksum) {
-                self.readstats.checksum_failures += 1;
-            }
-            e
-        })?;
 
-        match &result {
+        let block_slice: &[u8] = if matches!(self.shared.metadata.compression, Compression::None) {
+            let e = &self.shared.index.entries[idx];
+            let start = e.offset as usize;
+            &self.shared.mmaped_file[start..start + e.size as usize]
+        } else if use_last_hit {
+            &self.last_hit.as_ref().unwrap().1
+        } else {
+            self.block_decoder.out()
+        };
+
+        let result = match Self::search_block_slice(block_slice, key, skip) {
+            Ok(res) => res,
+            Err(e) => {
+                if matches!(e, StryxError::InvalidChecksum) {
+                    self.readstats.checksum_failures += 1;
+                }
+                return Err(e);
+            }
+        };
+
+        match result {
             Some(_) => self.readstats.point_hits += 1,
             None => self.readstats.point_misses += 1,
         }
         Ok(result)
+    }
+
+    // Reuses a caller-provided `Vec<u8>` buffer to avoid heap allocation once warmed up.
+    #[inline]
+    pub fn get_into(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, StryxError> {
+        match self.get_ref(key)? {
+            Some(val) => {
+                out.clear();
+                out.extend_from_slice(val);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Retrieves the value associated with the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Reading the underlying SSTable fails.
+    /// - A data block is corrupted.
+    /// - Checksum verification fails.
+    /// - Block decompression or decoding fails.
+    ///
+    /// Returns `Ok(None)` if the key does not exist.
+    #[inline]
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
+        Ok(self.get_ref(key)?.map(|v| v.to_vec()))
     }
 
     /// Check whether a key exists.
@@ -869,7 +931,7 @@ impl TableReader {
                     Some(a) => a,
                     None => self.loaded_block(),
                 };
-                Self::search_block(block, key)
+                Self::search_block(block, key, idx)
             }
             .map_err(|e| self.count_err(e))?;
 
@@ -996,17 +1058,6 @@ impl TableReader {
     /// Return runtime reader statistics.
     pub fn stats(&self) -> ReadStats {
         self.readstats
-    }
-
-    fn search_block(block: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, StryxError> {
-        let reader = BlockReader::new(block)?;
-        Ok(reader.get(key)?.map(|(v, _)| v.to_vec()))
-    }
-
-    #[allow(unused)]
-    fn search_block_ref<'a>(block: &'a [u8], key: &[u8]) -> Result<Option<&'a [u8]>, StryxError> {
-        let reader = BlockReader::new(block)?;
-        Ok(reader.get(key)?.map(|(v, _)| v))
     }
 
     fn load_block(&mut self, idx: usize) -> Result<(), StryxError> {
@@ -1294,11 +1345,20 @@ impl Iterator for TableIterator<'_> {
             self.block_idx += 1;
 
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
-                self.reader.block_buf.resize(size as usize, 0);
-                self.reader
+                let start = offset as usize;
+                let end = start
+                    .checked_add(size as usize)
+                    .ok_or(StryxError::InvalidOffset)?;
+
+                let buf = self
+                    .reader
                     .shared
-                    .file
-                    .read_exact_at(&mut self.reader.block_buf, offset)?;
+                    .mmaped_file
+                    .get(start..end)
+                    .ok_or(StryxError::InvalidOffset)?;
+
+                self.reader.block_buf.clear();
+                self.reader.block_buf.extend_from_slice(buf);
 
                 self.reader.readstats.blocks_read += 1;
                 self.reader.readstats.bytes_read += u64::from(size);
