@@ -22,7 +22,8 @@ use stryx::config::TableOptions;
 use stryx::reader::TableReader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Write a table. With the default options, keys are sorted for you.
+    // 1. Write a table. By default, records must already be lexicographically sorted.
+    // Use KeyOrder::Lexicographic to sort records automatically before writing.
     let mut table = TableBuilder::create("fruit.stryx", TableOptions::default())?;
     table.add(b"apple", b"red")?;
     table.add(b"banana", b"yellow")?;
