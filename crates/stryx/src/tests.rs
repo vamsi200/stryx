@@ -10,7 +10,10 @@ use rand::{RngExt, SeedableRng};
 use crate::builder::{Record, TableBuilder};
 use crate::config::{Compression, DuplicatePolicy, FilterType, KeyOrder, TableOptions};
 use crate::error::StryxError;
-use crate::reader::{OwnedRecord, TableReader};
+use crate::reader::{BlockReader, OwnedRecord, TableReader};
+
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -1812,4 +1815,588 @@ fn test_add_batch_success_appends_all_in_order() {
     for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
         assert_eq!(reader.get(k).unwrap(), Some(v.to_vec()));
     }
+}
+
+struct Tmp(PathBuf);
+
+impl Tmp {
+    fn new() -> Self {
+        Self(test_path())
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn compressions() -> [Compression; 3] {
+    [Compression::None, Compression::Lz4, Compression::Zstd(1)]
+}
+
+fn filters() -> [FilterType; 4] {
+    [
+        FilterType::None,
+        FilterType::BinaryFuse8,
+        FilterType::BinaryFuse16,
+        FilterType::BinaryFuse32,
+    ]
+}
+
+fn variants() -> Vec<(Compression, FilterType)> {
+    vec![
+        (Compression::None, FilterType::None),
+        (Compression::Lz4, FilterType::BinaryFuse8),
+        (Compression::Zstd(1), FilterType::BinaryFuse16),
+        (Compression::Lz4, FilterType::BinaryFuse32),
+    ]
+}
+
+fn build_small(path: &Path, compression: Compression, filter_type: FilterType) -> TestResult {
+    let _ = std::fs::remove_file(path);
+
+    let options = TableOptions {
+        compression,
+        filter_type,
+        block_size: 64,
+        ..TableOptions::default()
+    };
+
+    let mut table = TableBuilder::create(path, options)?;
+    for i in 0..30u32 {
+        table.add(
+            format!("key-{i:04}").as_bytes(),
+            format!("value-payload-{i:04}").as_bytes(),
+        )?;
+    }
+    table.finalize()?;
+    Ok(())
+}
+
+fn exercise(path: &Path) {
+    let Ok(mut r) = TableReader::open(path) else {
+        return;
+    };
+
+    let _ = r.get(b"key-0005");
+    let _ = r.get(b"missing");
+    let _ = r.contains_key(b"key-0010");
+    let _ = r.get_many(&[
+        b"key-0029".as_slice(),
+        b"",
+        b"key-0001",
+        b"zzz",
+        b"key-0001",
+    ]);
+
+    if let Ok(it) = r.prefix(b"key-") {
+        for item in it.take(1000) {
+            let _ = item;
+        }
+    }
+    if let Ok(it) = r.range(b"key-0003", b"key-0020") {
+        for item in it.take(1000) {
+            let _ = item;
+        }
+    }
+    for item in r.iter().take(1000) {
+        let _ = item;
+    }
+}
+
+fn panics(path: &Path) -> bool {
+    catch_unwind(AssertUnwindSafe(|| exercise(path))).is_err()
+}
+
+fn with_patch(original: &[u8], pos: usize, patch: &[u8]) -> Option<Vec<u8>> {
+    let mut m = original.to_vec();
+    m.get_mut(pos..pos.checked_add(patch.len())?)?
+        .copy_from_slice(patch);
+    Some(m)
+}
+
+fn crc_fix(bytes: &mut [u8], start: usize, end: usize) {
+    let crc = crc32c::crc32c(&bytes[start..end - 4]);
+    bytes[end - 4..end].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn patches() -> Vec<Vec<u8>> {
+    vec![
+        vec![0x00],
+        vec![0xFF],
+        vec![0x80],
+        vec![0xFF, 0xFF],
+        u32::MAX.to_le_bytes().to_vec(),
+        0x8000_0000u32.to_le_bytes().to_vec(),
+        0x4000_0000u32.to_le_bytes().to_vec(),
+    ]
+}
+
+#[test]
+fn sweep_every_truncation_never_panics_and_never_opens() -> TestResult {
+    let tmp = Tmp::new();
+    let mut panicked = Vec::new();
+    let mut opened = Vec::new();
+
+    for (idx, (compression, filter_type)) in variants().into_iter().enumerate() {
+        build_small(tmp.path(), compression, filter_type)?;
+        let original = std::fs::read(tmp.path())?;
+
+        for n in 0..original.len() {
+            std::fs::write(tmp.path(), &original[..n])?;
+            if panics(tmp.path()) {
+                panicked.push((idx, n));
+            }
+            if TableReader::open(tmp.path()).is_ok() {
+                opened.push((idx, n));
+            }
+        }
+    }
+
+    assert!(panicked.is_empty(), "panicked (variant, len): {panicked:?}");
+    assert!(
+        opened.is_empty(),
+        "truncated file unexpectedly opened (variant, len): {opened:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn sweep_every_byte_flip_never_panics() -> TestResult {
+    let tmp = Tmp::new();
+    let mut panicked = Vec::new();
+
+    for (idx, (compression, filter_type)) in variants().into_iter().enumerate() {
+        build_small(tmp.path(), compression, filter_type)?;
+        let original = std::fs::read(tmp.path())?;
+
+        for mask in [0x01u8, 0xFF] {
+            for pos in 0..original.len() {
+                let mut m = original.clone();
+                m[pos] ^= mask;
+                std::fs::write(tmp.path(), &m)?;
+                if panics(tmp.path()) {
+                    panicked.push((idx, pos, mask));
+                }
+            }
+        }
+    }
+
+    assert!(
+        panicked.is_empty(),
+        "panicked (variant, byte, mask): {panicked:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn sweep_extreme_integers_at_every_offset_never_panics() -> TestResult {
+    let tmp = Tmp::new();
+    let mut panicked = Vec::new();
+
+    for (idx, (compression, filter_type)) in variants().into_iter().take(2).enumerate() {
+        build_small(tmp.path(), compression, filter_type)?;
+        let original = std::fs::read(tmp.path())?;
+
+        for pos in 0..original.len() {
+            let mut candidates: Vec<Vec<u8>> = Vec::new();
+            for v in [u32::MAX, 0x8000_0000, 0x4000_0000] {
+                candidates.push(v.to_le_bytes().to_vec());
+            }
+            for v in [u64::MAX, 1u64 << 32] {
+                candidates.push(v.to_le_bytes().to_vec());
+            }
+
+            for patch in candidates {
+                let Some(m) = with_patch(&original, pos, &patch) else {
+                    continue;
+                };
+                std::fs::write(tmp.path(), &m)?;
+                if panics(tmp.path()) {
+                    panicked.push((idx, pos, patch.len()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        panicked.is_empty(),
+        "panicked (variant, offset, width): {panicked:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn checksum_aware_sweep_single_data_block() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let options = TableOptions {
+        compression: Compression::None,
+        filter_type: FilterType::None,
+        ..TableOptions::default()
+    };
+    let mut table = TableBuilder::create(tmp.path(), options)?;
+    for i in 0..8u32 {
+        table.add(
+            format!("key-{i:04}").as_bytes(),
+            format!("value-payload-{i:04}").as_bytes(),
+        )?;
+    }
+    table.finalize()?;
+
+    let meta = TableReader::open(tmp.path())?.metadata().clone();
+    assert_eq!(meta.block_count, 1, "test needs exactly one data block");
+
+    let original = std::fs::read(tmp.path())?;
+    let data_end = meta.index_offset as usize;
+
+    let mut check = original.clone();
+    crc_fix(&mut check, 0, data_end);
+    assert_eq!(
+        check, original,
+        "block CRC layout assumption is wrong; adjust crc_fix range for data blocks"
+    );
+
+    let mut panicked = Vec::new();
+    for pos in 0..data_end - 4 {
+        for patch in patches() {
+            let Some(mut m) = with_patch(&original, pos, &patch) else {
+                continue;
+            };
+            if pos + patch.len() > data_end - 4 {
+                continue;
+            }
+            crc_fix(&mut m, 0, data_end);
+            std::fs::write(tmp.path(), &m)?;
+            if panics(tmp.path()) {
+                panicked.push((pos, patch));
+            }
+        }
+    }
+
+    assert!(
+        panicked.is_empty(),
+        "panicked on CRC-valid corrupt block (offset, patch): {panicked:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn corrupt_block_is_never_treated_as_verified() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let options = TableOptions {
+        block_size: 128,
+        compression: Compression::None,
+        filter_type: FilterType::None,
+        ..TableOptions::default()
+    };
+    let mut table = TableBuilder::create(tmp.path(), options)?;
+    for i in 0..200u32 {
+        table.add(
+            format!("key-{i:04}").as_bytes(),
+            format!("value-payload-{i:04}").as_bytes(),
+        )?;
+    }
+    table.finalize()?;
+
+    let meta = TableReader::open(tmp.path())?.metadata().clone();
+    assert!(meta.block_count >= 3, "need several blocks");
+
+    let mut bytes = std::fs::read(tmp.path())?;
+    bytes[meta.index_offset as usize - 1] ^= 0xFF;
+    std::fs::write(tmp.path(), &bytes)?;
+
+    let mut reader = TableReader::open(tmp.path())?;
+
+    assert!(reader.get(b"key-0000")?.is_some());
+
+    // corrupt last block must fail every time, not just the first.
+    assert!(reader.get(b"key-0199").is_err());
+    assert!(reader.get(b"key-0199").is_err(), "retry must still fail");
+    assert!(reader.contains_key(b"key-0199").is_err());
+
+    // no partial results from get_many when one block is bad.
+    assert!(
+        reader
+            .get_many(&[b"key-0000".as_slice(), b"key-0199"])
+            .is_err()
+    );
+
+    // healthy block should work afterwards.
+    assert!(reader.get(b"key-0000")?.is_some());
+    assert!(reader.stats().checksum_failures >= 1);
+    Ok(())
+}
+
+#[test]
+fn key_len_u16_max_round_trips_through_table() -> TestResult {
+    for compression in compressions() {
+        let tmp = Tmp::new();
+        let _ = std::fs::remove_file(tmp.path());
+
+        let options = TableOptions {
+            compression,
+            ..TableOptions::default()
+        };
+        let long_key = vec![b'k'; u16::MAX as usize];
+
+        let mut table = TableBuilder::create(tmp.path(), options)?;
+        table.add(b"a", b"short")?;
+        table.add(&long_key, b"long-key-value")?;
+        table.finalize()?;
+
+        let mut reader = TableReader::open(tmp.path())?;
+        assert_eq!(reader.get(b"a")?.as_deref(), Some(b"short".as_slice()));
+        assert_eq!(
+            reader.get(&long_key)?.as_deref(),
+            Some(b"long-key-value".as_slice())
+        );
+        assert_eq!(reader.iter().collect::<Result<Vec<_>, _>>()?.len(), 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn key_len_above_u16_max_is_never_silently_accepted() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let too_long = vec![b'k'; u16::MAX as usize + 1];
+    let mut table = TableBuilder::create(tmp.path(), TableOptions::default())?;
+
+    if table.add(&too_long, b"v").is_ok() {
+        assert!(
+            table.finalize().is_err(),
+            "a 65536-byte key must be rejected by add() or finalize()"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_key_and_empty_value_round_trip() -> TestResult {
+    for compression in compressions() {
+        for filter_type in filters() {
+            let tmp = Tmp::new();
+            let _ = std::fs::remove_file(tmp.path());
+
+            let options = TableOptions {
+                compression,
+                filter_type,
+                ..TableOptions::default()
+            };
+            let mut table = TableBuilder::create(tmp.path(), options)?;
+            table.add(b"", b"")?;
+            table.add(b"a", b"")?;
+            table.add(b"b", b"x")?;
+            table.finalize()?;
+
+            let mut reader = TableReader::open(tmp.path())?;
+            assert_eq!(reader.get(b"")?, Some(Vec::new()));
+            assert_eq!(reader.get(b"a")?, Some(Vec::new()));
+            assert_eq!(reader.get(b"b")?, Some(b"x".to_vec()));
+            assert!(reader.contains_key(b"")?);
+            assert_eq!(reader.iter().collect::<Result<Vec<_>, _>>()?.len(), 3);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn block_size_zero_errors_or_works_but_never_panics() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let mut options = TableOptions::default();
+    options.block_size = 0;
+
+    let path = tmp.path().to_path_buf();
+    let result: Result<(), StryxError> = (|| {
+        let mut table = TableBuilder::create(&path, options)?;
+        for i in 0..10u32 {
+            table.add(format!("key-{i}").as_bytes(), b"v")?;
+        }
+        table.finalize()?;
+        Ok(())
+    })();
+
+    if result.is_ok() {
+        let mut reader = TableReader::open(tmp.path())?;
+        for i in 0..10u32 {
+            assert_eq!(
+                reader.get(format!("key-{i}").as_bytes())?.as_deref(),
+                Some(b"v".as_slice())
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn open_rejects_missing_empty_directory_and_garbage() -> TestResult {
+    let missing = Tmp::new();
+    let _ = std::fs::remove_file(missing.path());
+    assert!(TableReader::open(missing.path()).is_err(), "missing file");
+
+    let empty = Tmp::new();
+    std::fs::write(empty.path(), b"")?;
+    assert!(TableReader::open(empty.path()).is_err(), "empty file");
+
+    assert!(
+        TableReader::open(std::env::temp_dir()).is_err(),
+        "directory"
+    );
+
+    let garbage = Tmp::new();
+    let mut rng = StdRng::seed_from_u64(99);
+    let bytes: Vec<u8> = (0..1024).map(|_| rng.random::<u8>()).collect();
+    std::fs::write(garbage.path(), &bytes)?;
+    assert!(TableReader::open(garbage.path()).is_err(), "random bytes");
+    Ok(())
+}
+
+#[test]
+fn create_fails_cleanly_in_missing_directory() {
+    let path = std::env::temp_dir()
+        .join("stryx-no-such-dir-xyz")
+        .join("t.stryx");
+    assert!(TableBuilder::create(&path, TableOptions::default()).is_err());
+}
+
+#[test]
+fn cloned_readers_agree_across_threads() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let n = 500usize;
+    let options = TableOptions {
+        block_size: 256,
+        compression: Compression::Lz4,
+        filter_type: FilterType::BinaryFuse16,
+        ..TableOptions::default()
+    };
+    let mut table = TableBuilder::create(tmp.path(), options)?;
+    for i in 0..n {
+        table.add(
+            format!("key-{i:05}").as_bytes(),
+            format!("value-{i:05}").as_bytes(),
+        )?;
+    }
+    table.finalize()?;
+
+    let base = TableReader::open(tmp.path())?;
+
+    std::thread::scope(|s| {
+        for t in 0..4usize {
+            let mut reader = base.clone();
+            s.spawn(move || {
+                for step in 0..n {
+                    let i = (step * 7 + t * 131) % n;
+                    let key = format!("key-{i:05}");
+                    let value = format!("value-{i:05}");
+                    assert_eq!(
+                        reader.get(key.as_bytes()).unwrap().as_deref(),
+                        Some(value.as_bytes())
+                    );
+                    assert_eq!(reader.get(format!("missing-{i}").as_bytes()).unwrap(), None);
+                }
+
+                let keys: Vec<String> = (0..n).step_by(11).map(|i| format!("key-{i:05}")).collect();
+                let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+                let got = reader.get_many(&refs).unwrap();
+                assert_eq!(got.len(), keys.len());
+                for (i, v) in (0..n).step_by(11).zip(got) {
+                    assert_eq!(v, Some(format!("value-{i:05}").into_bytes()));
+                }
+            });
+        }
+    });
+
+    Ok(())
+}
+
+fn block_with_footer(record_count: u32, body: &[u8]) -> Vec<u8> {
+    let mut b = body.to_vec();
+    b.extend_from_slice(&record_count.to_le_bytes());
+    b.extend_from_slice(&[0u8; 4]);
+    b
+}
+
+#[test]
+fn test_block_reader_record_count_times_four_overflows_usize() {
+    for record_count in [u32::MAX, 0x8000_0000, 0x4000_0000, 0x4000_0001] {
+        let buf = block_with_footer(record_count, &[0u8; 16]);
+        assert!(
+            BlockReader::new(&buf).is_err(),
+            "record_count={record_count:#x}"
+        );
+    }
+}
+
+#[test]
+fn test_block_reader_value_len_u32_max_is_rejected() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&3u16.to_le_bytes()); // key_len
+    body.extend_from_slice(&u32::MAX.to_le_bytes()); // value_len
+    body.extend_from_slice(b"key");
+    body.extend_from_slice(b"val");
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let buf = block_with_footer(1, &body);
+
+    let reader = BlockReader::new(&buf).unwrap();
+    assert_eq!(reader.key_at(0).unwrap(), b"key");
+    assert!(reader.value_at(0, 3).is_err());
+    assert!(reader.value_at(0, usize::MAX).is_err());
+}
+
+#[test]
+fn test_block_reader_key_len_u16_max_on_short_buffer() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&u16::MAX.to_le_bytes());
+    body.extend_from_slice(&[0u8; 4]);
+    body.extend_from_slice(b"ab");
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let buf = block_with_footer(1, &body);
+
+    let reader = BlockReader::new(&buf).unwrap();
+    assert!(reader.key_at(0).is_err());
+    assert!(reader.key_at(usize::MAX).is_err());
+}
+
+#[test]
+fn prefix_of_ff_bytes_is_valid() -> TestResult {
+    let tmp = Tmp::new();
+    let _ = std::fs::remove_file(tmp.path());
+
+    let mut table = TableBuilder::create(tmp.path(), TableOptions::default())?;
+    table.add(&[0xFE], b"1")?;
+    table.add(&[0xFF], b"2")?;
+    table.add(&[0xFF, 0x00], b"3")?;
+    table.add(&[0xFF, 0xFF], b"4")?;
+    table.finalize()?;
+
+    let mut reader = TableReader::open(tmp.path())?;
+    assert_eq!(
+        reader
+            .prefix(&[0xFF])?
+            .collect::<Result<Vec<_>, _>>()?
+            .len(),
+        3
+    );
+    assert_eq!(
+        reader
+            .prefix(&[0xFF, 0xFF])?
+            .collect::<Result<Vec<_>, _>>()?
+            .len(),
+        1
+    );
+    Ok(())
 }

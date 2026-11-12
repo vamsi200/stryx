@@ -18,3 +18,4 @@ pub const VERSION: u32 = 1;
 
 pub(crate) const KEY_HASH_SEED: u64 = 0;
 pub(crate) const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+pub(crate) const MIN_ENTRY_LEN: usize = 2 + 8 + 4 + 4;

@@ -131,7 +131,7 @@ pub(crate) struct BlockReader<'a> {
 
 impl<'a> BlockReader<'a> {
     #[inline]
-    fn new(buf: &'a [u8]) -> Result<Self, StryxError> {
+    pub(crate) fn new(buf: &'a [u8]) -> Result<Self, StryxError> {
         let Some(footer_start) = buf.len().checked_sub(8) else {
             return Err(DecodeError::InvalidLength.into());
         };
@@ -139,8 +139,9 @@ impl<'a> BlockReader<'a> {
         let record_count =
             u32::from_le_bytes(buf[footer_start..footer_start + 4].try_into().unwrap()) as usize;
 
-        // Cannot overflow on 64-bit since record_count <= u32::MAX
-        let table_len = record_count * size_of::<u32>();
+        let Some(table_len) = record_count.checked_mul(size_of::<u32>()) else {
+            return Err(DecodeError::InvalidLength.into());
+        };
 
         let Some(records_end) = footer_start.checked_sub(table_len) else {
             return Err(DecodeError::InvalidLength.into());
@@ -215,7 +216,7 @@ impl<'a> BlockReader<'a> {
     }
 
     #[inline(always)]
-    fn key_at(&self, offset: usize) -> Result<&'a [u8], StryxError> {
+    pub(crate) fn key_at(&self, offset: usize) -> Result<&'a [u8], StryxError> {
         let Some(rem) = self.buf.get(offset..) else {
             return Self::err_truncated();
         };
@@ -298,19 +299,24 @@ impl<'a> BlockReader<'a> {
     }
 
     #[inline(always)]
-    fn value_at(&self, off: usize, key_len: usize) -> Result<&'a [u8], StryxError> {
+    pub(crate) fn value_at(&self, off: usize, key_len: usize) -> Result<&'a [u8], StryxError> {
         let Some(rem) = self.buf.get(off..) else {
             return Self::err_truncated();
         };
+
         if rem.len() < 6 {
             return Self::err_truncated();
         }
+
         let vlen = u32::from_le_bytes([rem[2], rem[3], rem[4], rem[5]]) as usize;
-        let val_start = 6 + key_len;
-        let val_end = val_start + vlen; // Safe on 64-bit: 6 + u16::MAX + u32::MAX < usize::MAX
-        let Some(val) = rem.get(val_start..val_end) else {
+
+        let Some(val) = key_len.checked_add(6).and_then(|val_start| {
+            let val_end = val_start.checked_add(vlen)?;
+            rem.get(val_start..val_end)
+        }) else {
             return Self::err_truncated();
         };
+
         Ok(val)
     }
 
@@ -520,6 +526,10 @@ impl TableReader {
             return Err(DecodeError::InvalidLength.into());
         }
 
+        if !metadata_size <= file_len {
+            return Err(DecodeError::InvalidLength.into());
+        }
+
         let mut metadata_buf = vec![0u8; usize::try_from(metadata_size)?];
         file.read_exact(&mut metadata_buf)?;
         let metadata = TableMetadata::decode(&metadata_buf)?;
@@ -545,6 +555,10 @@ impl TableReader {
 
             if filter_len != usize::try_from(remaining)? {
                 return Err(StryxError::InvalidRange);
+            }
+
+            if !metadata_size <= remaining {
+                return Err(DecodeError::InvalidLength.into());
             }
 
             let mut filter_data = vec![0u8; filter_len];
@@ -710,7 +724,7 @@ impl TableReader {
         // Prepare the block and record whether it lives in self.last_hit
         let use_last_hit = if matches!(self.shared.metadata.compression, Compression::None) {
             let e = &self.shared.index.entries[idx];
-            let start = e.offset as usize;
+            let start = usize::try_from(e.offset).map_err(|_| DecodeError::InvalidLength)?;
             let size = e.size as usize;
 
             let Some(data) = self.shared.mmaped_file.get(start..start + size) else {
@@ -773,7 +787,7 @@ impl TableReader {
 
         let block_slice: &[u8] = if matches!(self.shared.metadata.compression, Compression::None) {
             let e = &self.shared.index.entries[idx];
-            let start = e.offset as usize;
+            let start = usize::try_from(e.offset).map_err(|_| DecodeError::InvalidLength)?;
             &self.shared.mmaped_file[start..start + e.size as usize]
         } else if use_last_hit {
             &self.last_hit.as_ref().unwrap().1
@@ -1068,7 +1082,7 @@ impl TableReader {
         self.loaded_idx = None;
 
         let e = &self.shared.index.entries[idx];
-        let start = e.offset as usize;
+        let start = usize::try_from(e.offset).map_err(|_| DecodeError::InvalidLength)?;
         let size = e.size as usize;
         let uncompressed_size = e.uncompressed_block_size as usize;
 
@@ -1109,7 +1123,7 @@ impl TableReader {
             Compression::None => {
                 let idx = self.loaded_idx.expect("block must be loaded");
                 let e = &self.shared.index.entries[idx];
-                let start = e.offset as usize;
+                let start = usize::try_from(e.offset).expect("Invalid offset length");
                 &self.shared.mmaped_file[start..start + e.size as usize]
             }
             Compression::Zstd(_) | Compression::Lz4 => &self.block_decoder.out(),
@@ -1349,7 +1363,7 @@ impl Iterator for TableIterator<'_> {
             self.block_idx += 1;
 
             let result = (|| -> Result<Vec<OwnedRecord>, StryxError> {
-                let start = offset as usize;
+                let start = usize::try_from(offset).map_err(|_| DecodeError::InvalidLength)?;
                 let end = start
                     .checked_add(size as usize)
                     .ok_or(StryxError::InvalidOffset)?;

@@ -1,4 +1,9 @@
-use crate::{decoder::Decoder, error::StryxError, reader::key_lt};
+use crate::{
+    MIN_ENTRY_LEN,
+    decoder::Decoder,
+    error::{DecodeError, StryxError},
+    reader::key_lt,
+};
 use std::cmp::Ordering;
 
 #[derive(Debug)]
@@ -114,6 +119,10 @@ impl Index {
         decoder: &mut Decoder<'_>,
         entry_count: usize,
     ) -> Result<Self, StryxError> {
+        if entry_count > decoder.remaining() / MIN_ENTRY_LEN {
+            return Err(DecodeError::InvalidLength.into());
+        }
+
         let mut index = Self {
             key_data: Vec::new(),
             entries: Vec::with_capacity(entry_count),
@@ -233,7 +242,7 @@ pub struct IndexEntry {
     /// Encoded size of the block in bytes
     pub size: u32,
 
-    /// Uncompressed block size ini bytes
+    /// Uncompressed block size in bytes
     pub uncompressed_block_size: u32,
 }
 
