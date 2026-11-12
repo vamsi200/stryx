@@ -526,7 +526,7 @@ impl TableReader {
             return Err(DecodeError::InvalidLength.into());
         }
 
-        if !metadata_size <= file_len {
+        if metadata_size > file_len {
             return Err(DecodeError::InvalidLength.into());
         }
 
@@ -694,7 +694,7 @@ impl TableReader {
 
     // Zero-allocation lookup returning a borrowed slice directly from the mmap,
     // block cache or decompression buffer.
-    pub fn get_ref(&mut self, key: &[u8]) -> Result<Option<&[u8]>, StryxError> {
+    pub(crate) fn get_ref(&mut self, key: &[u8]) -> Result<Option<&[u8]>, StryxError> {
         if !self.xorf_contains(key) {
             self.readstats.point_misses += 1;
             return Ok(None);
@@ -737,12 +737,10 @@ impl TableReader {
 
                 if !self.shared.disable_block_verification
                     && !self.shared.crc_verification[idx].load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Err(e) =
+                    && let Err(e) =
                         Self::verify_block_once(&self.shared, &mut self.readstats, idx, data)
-                    {
-                        return Err(self.count_err(e));
-                    }
+                {
+                    return Err(self.count_err(e));
                 }
                 self.loaded_idx = Some(idx);
             }
@@ -810,19 +808,6 @@ impl TableReader {
             None => self.readstats.point_misses += 1,
         }
         Ok(result)
-    }
-
-    // Reuses a caller-provided `Vec<u8>` buffer to avoid heap allocation once warmed up.
-    #[inline]
-    pub fn get_into(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, StryxError> {
-        match self.get_ref(key)? {
-            Some(val) => {
-                out.clear();
-                out.extend_from_slice(val);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
     }
 
     /// Retrieves the value associated with the given key.
@@ -1126,7 +1111,7 @@ impl TableReader {
                 let start = usize::try_from(e.offset).expect("Invalid offset length");
                 &self.shared.mmaped_file[start..start + e.size as usize]
             }
-            Compression::Zstd(_) | Compression::Lz4 => &self.block_decoder.out(),
+            Compression::Zstd(_) | Compression::Lz4 => self.block_decoder.out(),
         }
     }
 }

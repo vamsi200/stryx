@@ -352,7 +352,7 @@ fn test_binary_keys() -> TestResult {
     Ok(())
 }
 
-pub fn random_records(n: usize, sorted: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+fn random_records(n: usize, sorted: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut rng = StdRng::seed_from_u64(42);
 
     let mut records: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
