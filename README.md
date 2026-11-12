@@ -172,6 +172,87 @@ A lookup does this:
 3. The block is read (or taken from a cache), decompressed if needed, and checksummed on first use.
 4. A binary search over the offset table finds the record.
 
+## Benchmarks
+
+Benchmarked using Criterion on `i5-12450h`, running `linux (6.18.38-1-lts)` and rust version - `1.96.0`. Benchmarks use the optimized build profile with debug information enabled.
+
+### Point Lookups
+
+| Operation | Configuration | Time | Throughput |
+|---|---|---:|---:|
+| `get` hit | No filter | 79.860 µs | 12.82 Melem/s |
+| `get` hit | XOR filter, 8 bits/key | 96.995 µs | 10.56 Melem/s |
+| `get` hit | XOR filter, 16 bits/key | 97.540 µs | 10.50 Melem/s |
+| `get` hit | XOR filter, 32 bits/key | 99.296 µs | 10.31 Melem/s |
+| `get` miss | Bloom filter, 8 bits/key | 9.540 µs | 107.34 Melem/s |
+| `get` miss | Bloom filter, 16 bits/key | 9.248 µs | 110.73 Melem/s |
+| `get` miss | Bloom filter, 32 bits/key | 9.374 µs | 109.24 Melem/s |
+| `get` miss | No filter | 11.973 µs | 85.53 Melem/s |
+
+### Table Opening
+
+| Records | `open` | `open` + first `get` |
+|---:|---:|---:|
+| 10,000 | 14.771 µs | 18.203 µs |
+| 100,000 | 82.167 µs | 84.691 µs |
+| 1,000,000 | 739.210 µs | 734.030 µs |
+
+### Batch Lookups
+
+| Operation | Batch size | Time | Throughput |
+|---|---:|---:|---:|
+| `get_many` (hits) | 8 | 770.61 ns | 10.38 Melem/s |
+| `get_many` (hits) | 64 | 8.062 µs | 7.94 Melem/s |
+| `get_many` (hits) | 256 | 34.702 µs | 7.38 Melem/s |
+| `get_many` (hits) | 1,024 | 197.720 µs | 5.18 Melem/s |
+| `get_many` (mixed) | 8 | 499.36 ns | 16.02 Melem/s |
+| `get_many` (mixed) | 64 | 5.675 µs | 11.28 Melem/s |
+| `get_many` (mixed) | 256 | 26.740 µs | 9.57 Melem/s |
+
+### Sequential Scans
+
+| Configuration | Block size | Time | Throughput |
+|---|---:|---:|---:|
+| No compression | 4 KiB | 6.678 ms | 642.64 MiB/s |
+| No compression | 16 KiB | 9.124 ms | 470.35 MiB/s |
+| LZ4 | 4 KiB | 9.306 ms | 461.14 MiB/s |
+| Zstd level 1 | 4 KiB | 14.006 ms | 306.41 MiB/s |
+
+### Range and Prefix Queries
+
+| Operation | Configuration | Time | Throughput |
+|---|---|---:|---:|
+| `range` | 10,000 records, no compression | 952.39 µs | 10.50 Melem/s |
+| `range` | 10,000 records, LZ4 | 1.055 ms | 9.48 Melem/s |
+| `prefix` | 10,000 matching records | 931.99 µs | 10.73 Melem/s |
+
+### Concurrent Readers
+
+Four-thread scaling for point lookups:
+
+| Threads | Time | Throughput |
+|---:|---:|---:|
+| 1 | 93.329 µs | 10.97 Melem/s |
+| 2 | 41.234 µs | 24.83 Melem/s |
+| 4 | 25.608 µs | 39.99 Melem/s |
+
+### Block Cache
+
+The block cache has workload-dependent benefits. It provides little improvement for uncompressed uniform workloads, but can substantially improve repeated access to compressed hot data.
+
+| Compression | Access pattern | Cache capacity | Time |
+|---|---|---:|---:|
+| None | Uniform | Disabled | 1.865 ms |
+| None | Uniform | 125% | 1.873 ms |
+| None | Sequential | Disabled | 531.21 µs |
+| None | Sequential | 125% | 549.01 µs |
+| LZ4 | Hot | Disabled | 5.052 ms |
+| LZ4 | Hot | 50% | 2.446 ms |
+| LZ4 | Hot | 125% | 1.599 ms |
+| LZ4 | Sequential | Disabled | 552.98 µs |
+| LZ4 | Sequential | 125% | 483.15 µs |
+
+
 ## Limitations
 
 ### Concurrency
