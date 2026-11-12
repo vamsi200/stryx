@@ -701,6 +701,7 @@ impl TableReader {
         let idx = block - 1;
 
         let skip = if block < self.shared.index.entries.len() {
+            debug_assert!(key.len() >= self.shared.index.lcp_len);
             self.shared.index.lcp_len
         } else {
             0
@@ -926,12 +927,15 @@ impl TableReader {
                 cur_block = Some(idx);
             }
 
+            let n = self.shared.index.entries.len();
+            let skip = if p < n { self.shared.index.lcp_len } else { 0 };
+
             let found: Option<Vec<u8>> = {
                 let block: &[u8] = match &cur_arc {
                     Some(a) => a,
                     None => self.loaded_block(),
                 };
-                Self::search_block(block, key, idx)
+                Self::search_block(block, key, skip)
             }
             .map_err(|e| self.count_err(e))?;
 
