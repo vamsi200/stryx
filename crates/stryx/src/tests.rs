@@ -494,9 +494,11 @@ fn test_compression() -> TestResult {
 fn test_lexicographic_key_order() -> Result<(), StryxError> {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.key_order = crate::config::KeyOrder::Lexicographic;
-    options.compression = Compression::None;
+    let options = TableOptions {
+        key_order: crate::config::KeyOrder::Lexicographic,
+        compression: Compression::None,
+        ..Default::default()
+    };
 
     let (keys, values) = random_records(1000, false);
 
@@ -570,8 +572,10 @@ fn test_empty_table() -> TestResult {
 fn test_duplicate_keys_allowed() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.duplicate_policy = DuplicatePolicy::Allow;
+    let options = TableOptions {
+        duplicate_policy: DuplicatePolicy::Allow,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -605,9 +609,11 @@ fn test_duplicate_keys_allowed() -> TestResult {
 fn test_duplicate_keys_across_blocks() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.duplicate_policy = DuplicatePolicy::Allow;
-    options.block_size = 1;
+    let options = TableOptions {
+        duplicate_policy: DuplicatePolicy::Allow,
+        block_size: 1,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -641,8 +647,10 @@ fn test_duplicate_keys_across_blocks() -> TestResult {
 fn test_oversized_record() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.block_size = 64;
+    let options = TableOptions {
+        block_size: 64,
+        ..Default::default()
+    };
 
     let key = vec![b'k'; 128];
     let value = vec![b'v'; 4096];
@@ -675,8 +683,10 @@ fn test_record_at_block_size_boundary() -> TestResult {
     let key = b"key";
     let value = vec![b'x'; 64];
 
-    let mut options = TableOptions::default();
-    options.block_size = key.len() + value.len() + 6;
+    let options = TableOptions {
+        block_size: key.len() + value.len() + 6,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -713,8 +723,10 @@ fn test_first_and_last_keys() -> TestResult {
 fn test_large_record_count() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.block_size = 4096;
+    let options = TableOptions {
+        block_size: 4096,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -780,9 +792,11 @@ fn test_empty_batch() -> TestResult {
 fn test_lexicographic_sort_rejects_duplicates() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.key_order = KeyOrder::Lexicographic;
-    options.duplicate_policy = DuplicatePolicy::Reject;
+    let options = TableOptions {
+        key_order: KeyOrder::Lexicographic,
+        duplicate_policy: DuplicatePolicy::Reject,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -802,9 +816,11 @@ fn test_lexicographic_sort_rejects_duplicates() -> TestResult {
 fn test_lexicographic_sort_allows_duplicates() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.key_order = KeyOrder::Lexicographic;
-    options.duplicate_policy = DuplicatePolicy::Allow;
+    let options = TableOptions {
+        key_order: KeyOrder::Lexicographic,
+        duplicate_policy: DuplicatePolicy::Allow,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
 
@@ -840,8 +856,10 @@ fn test_lexicographic_sort_allows_duplicates() -> TestResult {
 fn test_corrupted_data_block_checksum() -> TestResult {
     let path = test_path();
 
-    let mut options = TableOptions::default();
-    options.compression = Compression::None;
+    let options = TableOptions {
+        compression: Compression::None,
+        ..Default::default()
+    };
 
     let mut table = TableBuilder::create(&path, options)?;
     table.add(b"apple", b"red")?;
@@ -2215,8 +2233,10 @@ fn block_size_zero_errors_or_works_but_never_panics() -> TestResult {
     let tmp = Tmp::new();
     let _ = std::fs::remove_file(tmp.path());
 
-    let mut options = TableOptions::default();
-    options.block_size = 0;
+    let options = TableOptions {
+        block_size: 0,
+        ..Default::default()
+    };
 
     let path = tmp.path().to_path_buf();
     let result: Result<(), StryxError> = (|| {
