@@ -16,6 +16,12 @@ You write a set of key-value pairs once, and then read it back with fast point l
 
 ## Quick start
 
+```bash
+cargo new dummy_project
+cd dummy_project
+cargo add stryx
+```
+
 ```rust
 use stryx::builder::TableBuilder;
 use stryx::config::TableOptions;
